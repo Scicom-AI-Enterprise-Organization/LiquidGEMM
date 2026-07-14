@@ -16,6 +16,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "ninja", "pybind11"]
 
+# Auto-loaded by every vLLM process (incl. worker subprocesses) so the "liquidgemm"
+# quantization method is registered everywhere.
+[project.entry-points."vllm.general_plugins"]
+liquidgemm = "liquidgemm.vllm_plugin:register"
+
 [tool.setuptools.packages.find]
 include = ["liquidgemm*"]
 
