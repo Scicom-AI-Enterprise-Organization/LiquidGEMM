@@ -41,3 +41,24 @@ def test_unfused_matches_reference_and_fp(name, N, K, M):
     y_fp = X @ W.t()
     cos = torch.nn.functional.cosine_similarity(y_gpu.cpu().flatten(), y_fp.flatten(), dim=0)
     assert cos > 0.99, f"[{name} M={M}] cosine vs fp too low: {cos:.4f}"
+
+
+@pytest.mark.skipif(not _HAVE_EXT, reason="liquidgemm._C not built")
+@pytest.mark.parametrize("name,N,K", LLAMA)
+@pytest.mark.parametrize("M", M_SWEEP)
+def test_fused_dp4a_matches_reference(name, N, K, M):
+    """Fused dp4a kernel must match the int8-domain reference (exact int accumulation)."""
+    torch.manual_seed(0)
+    W = torch.randn(N, K) * 0.05
+    X = torch.randn(M, K)
+    qw = quant.quantize_weight(W, group_size=64)
+    x_i8, ascale = quant.quantize_activation(X)
+
+    y_ref = quant.w4a8_matmul(x_i8, ascale, qw)                # [M, N] float32 (cpu)
+    y_gpu = ops.w4a8_gemm(x_i8, ascale, qw, out_dtype=torch.float32).cpu()
+    # fp32 accumulate of exact ints -> should match reference to float round-off.
+    torch.testing.assert_close(y_gpu, y_ref, rtol=2e-4, atol=2e-4)
+
+    y_fp = X @ W.t()
+    cos = torch.nn.functional.cosine_similarity(y_gpu.flatten(), y_fp.flatten(), dim=0)
+    assert cos > 0.99, f"[{name} M={M}] fused cosine vs fp too low: {cos:.4f}"

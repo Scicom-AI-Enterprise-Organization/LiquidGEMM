@@ -10,6 +10,7 @@ import torch
 
 from . import _C  # noqa: F401  (side effect: registers torch.ops.liquidgemm.*)
 from .quant import LiquidQuantWeight
+from .pack import pack_nibbles
 
 
 def dequant_weight_i8(qw: LiquidQuantWeight) -> torch.Tensor:
@@ -50,3 +51,17 @@ def w4a8_linear_unfused(
         acc = acc[:M]
     y = acc.to(torch.float32) * ascale.cuda()[:, None] * qw.s1.cuda()[None, :]
     return y.to(out_dtype), acc
+
+
+def w4a8_gemm(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight,
+              out_dtype: torch.dtype = torch.float16):
+    """Fused W4A8 GEMM (dp4a): 4-bit weights read from GMEM, dequant in registers.
+
+    Returns Y [M, N] in ``out_dtype``. The kernel accumulates in fp32; the cast is applied
+    on return.
+    """
+    packed = pack_nibbles(qw.qweight_u4).cuda().contiguous()  # [N, K//2] uint8
+    y = torch.ops.liquidgemm.w4a8_gemm(
+        x_i8.cuda().contiguous(), packed, qw.s_u8.cuda(), qw.offset_a.cuda(),
+        qw.s1.cuda(), ascale.cuda(), qw.N, qw.K, qw.group_size)
+    return y.to(out_dtype)
