@@ -78,6 +78,55 @@ def w4a8_linear_unfused(
     return y.to(out_dtype), acc
 
 
+def repack_rs_weight(qw: LiquidQuantWeight) -> torch.Tensor:
+    """Prepack UINT4 weights into WGMMA-RS *fragment order* for coalesced register fills.
+
+    Uses the (m,k) coordinates dumped by the wgmma_rs_a_coords op (correct by
+    construction — no hand-derived PTX layout). Output: uint8
+    [N/64, K/128, 128 threads, 32 bytes]; thread t's 64 nibbles for tile (rb, kt) in
+    fragment-element order, two nibbles per byte (low nibble = even element).
+    """
+    coords = torch.ops.liquidgemm.wgmma_rs_a_coords().cpu()  # [128, 64, 2]
+    T, E, _ = coords.shape
+    m = coords[..., 0].long()
+    k = coords[..., 1].long()
+    # Structural invariants the packed kernel relies on: each 32-bit register holds
+    # 4 consecutive-k elements of ONE row (=> one LiquidQuant group per register).
+    m4 = m.view(T, E // 4, 4)
+    k4 = k.view(T, E // 4, 4)
+    assert (m4 == m4[..., :1]).all(), "RS fragment register spans multiple rows"
+    assert (k4 - k4[..., :1] == torch.arange(4)).all(), "RS fragment k not consecutive"
+    assert (k4[..., 0] % 4 == 0).all(), "RS fragment k not 4-aligned"
+
+    N, K = qw.N, qw.K
+    RB, KT = N // 64, K // 128
+    q = qw.qweight_u4.view(RB, 64, KT, 128).permute(0, 2, 1, 3)  # [RB, KT, 64rows, 128k]
+    out = q[:, :, m, k]                                          # [RB, KT, 128thr, 64elem]
+    packed = (out[..., 0::2] | (out[..., 1::2] << 4)).to(torch.uint8)
+    return packed.contiguous()                                   # [RB, KT, 128, 32]
+
+
+def w4a8_gemm_rs(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight,
+                 rs_packed: torch.Tensor = None,
+                 out_dtype: torch.dtype = torch.float16):
+    """RS-WGMMA W4A8 linear: in-register dequant (the paper's datapath). Pads M to 64."""
+    M, K, N = x_i8.shape[0], qw.K, qw.N
+    pad = (-M) % 64
+    xin = x_i8.cuda().contiguous()
+    if pad:
+        xin = torch.cat([xin, xin.new_zeros(pad, K)], 0)
+    if rs_packed is None:
+        w, packed = pack_nibbles(qw.qweight_u4).cuda().contiguous(), False
+    else:
+        w, packed = rs_packed.cuda(), True
+    acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
+        xin, w, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, qw.group_size, packed)[:M]
+    y = torch.ops.liquidgemm.scale_epilogue(
+        acc, ascale.cuda().contiguous(), qw.s1.cuda(),
+        {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[out_dtype])
+    return y
+
+
 def w4a8_gemm(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight,
               out_dtype: torch.dtype = torch.float16):
     """Fused W4A8 GEMM (dp4a): 4-bit weights read from GMEM, dequant in registers.

@@ -39,3 +39,24 @@ def test_fused_w4a8_wgmma_matches_reference(M, N, K):
     got = torch.ops.liquidgemm.w4a8_wgmma(x_i8, packed, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, 64)
     ref = torch._int_mm(x_i8, quant.dequantize_i8(qw).cuda().t().contiguous())
     assert torch.equal(got, ref), f"fused W4A8 WGMMA mismatch at {M}x{N}x{K}"
+
+
+@pytest.mark.skipif(not _HAVE, reason="extension not built")
+@pytest.mark.parametrize("M,N,K", SHAPES)
+@pytest.mark.parametrize("packed", [False, True])
+def test_rs_w4a8_wgmma_matches_reference(M, N, K, packed):
+    """RS WGMMA (in-register dequant, the paper's datapath) == reference, v1 + prepacked."""
+    from liquidgemm import quant, ops
+    from liquidgemm.pack import pack_nibbles
+    torch.manual_seed(0)
+    W = torch.randn(N, K) * 0.05
+    qw = quant.quantize_weight(W, 64)
+    x_i8 = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
+    if packed:
+        w = ops.repack_rs_weight(qw).cuda()
+    else:
+        w = pack_nibbles(qw.qweight_u4).cuda().contiguous()
+    got = torch.ops.liquidgemm.w4a8_wgmma_rs(
+        x_i8, w, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, 64, packed)
+    ref = torch._int_mm(x_i8, quant.dequantize_i8(qw).cuda().t().contiguous())
+    assert torch.equal(got, ref), f"RS W4A8 WGMMA (packed={packed}) mismatch at {M}x{N}x{K}"
