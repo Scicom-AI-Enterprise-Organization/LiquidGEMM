@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+
+# CUDA / native build
+*.so
+*.o
+*.a
+*.ptx
+*.cubin
+
+# Third-party (cloned on the remote box; reference only, not vendored)
+third_party/cutlass/
+third_party/omniserve/
+
+# Artifacts / data / models
+models/
+data/
+results/
+wandb/
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Local env / secrets
+.env
+.DS_Store

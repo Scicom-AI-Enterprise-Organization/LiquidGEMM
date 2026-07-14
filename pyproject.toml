@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liquidgemm"
+version = "0.0.1"
+description = "Hardware-efficient W4A8-INT8 GEMM kernel for Hopper (arXiv:2509.01229) + vLLM integration"
+requires-python = ">=3.10"
+# NOTE: torch is intentionally NOT pinned here — it is provided by the remote NGC
+# container (torch 2.9.0a0, CUDA 13). Do not let the installer reinstall it.
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ninja", "pybind11"]
+
+[tool.setuptools.packages.find]
+include = ["liquidgemm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
