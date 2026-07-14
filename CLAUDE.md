@@ -107,7 +107,14 @@ claude-ping.json    # remote-box connection config
 - **vLLM baseline:** `int8_w4a8` via llm-compressor (compressed-tensors W4A8-INT8), served
   in stock vLLM, on Llama-3.1-8B-Instruct.
 
-## Status
+## Status — COMPLETE (see bench/RESULTS.md for all numbers)
+
+The paper's kernel (RS-WGMMA, in-register IMAD+XOR dequant, fragment-order 4-bit pack,
+dequant/MMA overlap) is implemented, bit-exact, and serving in vLLM under CUDA graphs.
+Production recommendation: **int8 mode** (default) — 1.4–1.75× bf16 throughput at ~1.7×
+less memory, validated on H20 (gemma-31B) and H100 (Llama-3.1-8B). w4 mode = max memory
+savings (true 4-bit). Remaining perf work for w4 on big-compute parts (H100/H800):
+TMA + multi-CTA warp specialization + split-K.
 
 Full plan: `/Users/husein.z/.claude/plans/functional-orbiting-kite.md`.
 

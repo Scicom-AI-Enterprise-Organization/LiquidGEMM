@@ -121,6 +121,46 @@ reference. Latency vs cuBLAS bf16 (H20 GPU6, prefill/concurrency M):
 vanishes, plus warp-specialized ImFP producer/consumer. That RS+ImFP step is the remaining
 kernel work; the SS version here proves the WGMMA + LiquidQuant-dequant datapath is correct.
 
+## Final validation — Llama-3.1-8B on an idle H100 SXM (RunPod)
+
+The shared H20 box became fully occupied, so final clean numbers were taken on a RunPod
+1× H100 SXM (driver 580, torch 2.11+cu130, vLLM 0.25.1, extension built sm_90a with nvcc
+12.8). **102/102 tests green on the H100** — the whole stack revalidates on a second
+Hopper machine. Model: `NousResearch/Meta-Llama-3.1-8B-Instruct` (ungated mirror;
+meta-llama repo gated). Serving = CUDA graphs, out=128.
+
+| mode | batch 1 | batch 30 | weights |
+|---|---:|---:|---:|
+| bf16 | 158.1 tok/s | 4320 tok/s | 15.0 GiB |
+| **LiquidGEMM int8 (CUTLASS)** | **228.7 (1.45×)** | **6053 (1.40×)** | 8.99 GiB |
+| **LiquidGEMM w4 (RS-WGMMA)** | 80.5 (0.51×) | 2279 (0.53×) | **5.83 GiB** |
+
+- **int8 mode: 1.40–1.45× faster than bf16 on H100** — the production win replicates
+  across GPUs (H20/gemma-31B was 1.74×). This is the recommended serving mode.
+- **w4 mode (the paper's RS-WGMMA kernel) serves end-to-end under CUDA graphs** with true
+  4-bit weights (2.6× less than bf16) at ~0.5× bf16 speed on H100. On H20 the same kernel
+  is ~1.0–1.1× bf16 at M≥128 — H100's ~7× faster tensor cores raise the bar, and closing
+  it there needs TMA + multi-CTA warp specialization + split-K (the paper's remaining
+  ExCP/ImFP engineering, documented as future work).
+- Generations correct in all modes (17×23=391 etc.).
+
+**Accuracy — WikiText-2 PPL, Llama-3.1-8B (40×2048 ctx):**
+
+| scheme | ppl |
+|---|---:|
+| bf16 | 6.929 |
+| LiquidQuant W4 | 7.483 |
+| RTN int4 g64 W4 | 7.440 |
+| RTN int4 g128 W4 | 7.635 |
+| LiquidQuant W4A8 | 7.569 |
+| RTN int4 g64 W4A8 | 7.554 |
+
+Honest read: on Llama-3.1-8B, LiquidQuant ≈ RTN g64 (within noise; both clearly beat
+g128) — unlike Qwen2.5-3B where LiquidQuant was decisively better (8.38 vs 9.31). The
+LQQ advantage is model-dependent: it pays off on weight distributions with outliers
+(Qwen), while its protective range costs a little resolution on well-behaved ones (Llama).
+Both models: W4A8 ≈ W4 + small activation penalty, i.e. int8 activations are cheap.
+
 ## Reproduce
 ```
 CUDA_VISIBLE_DEVICES=6 python bench/microbench.py
