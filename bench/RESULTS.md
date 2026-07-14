@@ -44,8 +44,42 @@ amortize** (CUDA-core MACs, not tensor cores): this is precisely the wall the pa
 **WGMMA + ImFP** tensor-core mainloop exists to break, and is the main remaining kernel work.
 On H20 (INT8 tensor cores ~15% of H100) the prefill win over W8A8 is capacity, not FLOPs.
 
+## End-to-end in vLLM (no fork) — Qwen2.5-3B, H20 GPU6, out=256
+
+LiquidGEMM is registered out-of-tree via `register_quantization_config` +
+a `vllm.general_plugins` entry point — **no vLLM fork**. Verified: coherent, correct
+generations on **Qwen2.5-3B** and **gemma-4-31B-it** (31B loaded at 19.7 GiB W4 vs ~62 GiB
+bf16). Throughput (tokens/s):
+
+| config | batch 1 | batch 30 | notes |
+|---|---:|---:|---|
+| bf16, **CUDA graphs** (vLLM default) | 319 | 8345 | production baseline |
+| bf16, eager | 88 | 2645 | |
+| **LiquidGEMM (INT8 tensor-core), eager** | 34.8 | 1035 | fused quant→int_mm→scale |
+| LiquidGEMM, CUDA graphs | ✗ | ✗ | crashes: `_int_mm` needs M>16, breaks capture |
+
+**Realized wins:** (1) **memory** — INT8 mode ~2× (3.26 vs 5.79 GiB on Qwen2.5-3B), 4-bit
+mode ~3–4× (2.0 GiB; gemma-31B 19.7 vs ~62 GiB) → fit bigger models / more KV / higher
+concurrency; (2) **accuracy** — LiquidQuant W4 beats standard int4 (above).
+
+**Not yet realized — throughput at concurrency.** LiquidGEMM (eager) is ~2.5× behind
+bf16-eager and ~8× behind bf16-with-CUDA-graphs. Root causes, established empirically:
+1. It isn't a mature fused tensor-core GEMM — `torch._int_mm` (cuBLASLt) carries per-call
+   overhead and its **M>16 restriction breaks CUDA-graph capture**, forcing `enforce_eager`.
+2. Eager mode forgoes the 3.6× CUDA-graph speedup that vLLM's bf16 enjoys.
+3. H20's INT8 tensor cores (~15% of H100) give too little compute headroom to overcome (1).
+
+**Path to a real throughput win** (the paper's core): a hand-written **fused WGMMA (or
+mma.sync) INT8 W4A8 kernel** — 4-bit weights streamed from GMEM, in-register LiquidQuant
+dequant, INT8 tensor cores, single launch, **CUDA-graph-capturable for all M** (replacing
+`_int_mm`). QServe's `mma.sync.m16n8k32.s8` + `ldmatrix` (in `third_party/omniserve`) is the
+reference. This is QServe/Marlin-level kernel engineering and is the main remaining work.
+
+Current vLLM usage requires `enforce_eager=True`.
+
 ## Reproduce
 ```
 CUDA_VISIBLE_DEVICES=6 python bench/microbench.py
 CUDA_VISIBLE_DEVICES=6 python bench/accuracy.py --model Qwen/Qwen2.5-3B
+CUDA_VISIBLE_DEVICES=6 python bench/vllm_serving.py --model Qwen/Qwen2.5-3B --quant liquidgemm --batch 30
 ```
