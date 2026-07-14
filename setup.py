@@ -10,7 +10,14 @@ Build in place on the remote H20 box:
 import os
 
 from setuptools import setup
+import torch.utils.cpp_extension as _cppext
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# Allow building with an nvcc one CUDA major older than torch's runtime (e.g. nvcc 12.8
+# vs torch+cu130): sm_90a cubins from 12.x load fine under a cu13-capable driver, and
+# both cudart sonames can coexist in-process. Opt-in via env to keep the guard by default.
+if os.environ.get("LIQUIDGEMM_SKIP_CUDA_CHECK") == "1":
+    _cppext._check_cuda_version = lambda *a, **k: None
 
 CUTLASS_DIR = os.environ.get("CUTLASS_DIR", os.path.abspath("third_party/cutlass"))
 

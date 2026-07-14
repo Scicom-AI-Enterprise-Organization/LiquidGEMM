@@ -157,15 +157,11 @@ class LiquidGemmLinearMethod(LinearMethodBase):
 
         if self.cfg.w4:
             # True 4-bit weights via RS-WGMMA (in-register dequant -> INT8 tensor cores).
-            # Pad tokens to the 64-token CTA tile; CUDA-graph-safe (static shapes).
+            # The op pads tokens to its 64-token CTA tile internally (compile/graph-safe).
             x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)
-            M = x_i8.shape[0]
-            pad = (-M) % 64
-            if pad:
-                x_i8 = torch.cat([x_i8, x_i8.new_zeros(pad, layer.lq_K)], 0)
             acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
                 x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_offset_a,
-                N, layer.lq_K, self.cfg.group_size, True)[:M]
+                N, layer.lq_K, self.cfg.group_size, True)
             odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
             y = torch.ops.liquidgemm.scale_epilogue(acc, ascale, layer.lq_s1, odt)
         else:

@@ -125,18 +125,15 @@ def repack_rs_weight(qw: LiquidQuantWeight) -> torch.Tensor:
 def w4a8_gemm_rs(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight,
                  rs_packed: torch.Tensor = None,
                  out_dtype: torch.dtype = torch.float16):
-    """RS-WGMMA W4A8 linear: in-register dequant (the paper's datapath). Pads M to 64."""
-    M, K, N = x_i8.shape[0], qw.K, qw.N
-    pad = (-M) % 64
-    xin = x_i8.cuda().contiguous()
-    if pad:
-        xin = torch.cat([xin, xin.new_zeros(pad, K)], 0)
+    """RS-WGMMA W4A8 linear: in-register dequant (the paper's datapath). Any M (op pads)."""
+    K, N = qw.K, qw.N
     if rs_packed is None:
         w, packed = pack_nibbles(qw.qweight_u4).cuda().contiguous(), False
     else:
         w, packed = rs_packed.cuda(), True
     acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
-        xin, w, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, qw.group_size, packed)[:M]
+        x_i8.cuda().contiguous(), w, qw.s_u8.cuda(), qw.offset_a.cuda(),
+        N, K, qw.group_size, packed)
     y = torch.ops.liquidgemm.scale_epilogue(
         acc, ascale.cuda().contiguous(), qw.s1.cuda(),
         {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[out_dtype])

@@ -123,16 +123,26 @@ Full plan: `/Users/husein.z/.claude/plans/functional-orbiting-kite.md`.
   - ✅ Microbench (`bench/microbench.py`) + **accuracy** (`bench/accuracy.py`). See
     `bench/RESULTS.md`: decode M=1 ≈ **1.0–1.17× cuBLAS bf16** (~800–910 GB/s); LiquidQuant
     W4 ppl **8.38 vs standard RTN int4 9.31** (bf16 7.63) on Qwen2.5-3B.
-- **Remaining (large, follow-up):**
-  - ⏭️ **WGMMA+TMA+ImFP mainloop** for M≥4 prefill — dp4a doesn't amortize past M=1
-    (0.05–0.36× bf16). This is the paper's core tensor-core contribution.
-  - ⏭️ **vLLM serving integration.** Blocker: the container's torch is a 2.9 **nightly** and
-    torchaudio is already ABI-broken against it → prebuilt vLLM wheels won't load. Path: a
-    **dedicated `uv` venv with stable torch + cu12x**, rebuild the extension there, add a
-    `LiquidGemmLinearMethod`, convert an llm-compressor W4A8 checkpoint, serve Llama/Qwen,
-    benchmark throughput/TTFT/TPOT vs vLLM's `int8_w4a8`.
-  - Llama-3.1-8B is **gated** (no HF token on the box) → accuracy used Qwen2.5-3B; set
-    `HF_TOKEN` to use Llama.
+- **vLLM integration done (no fork):** out-of-tree plugin `liquidgemm/vllm_plugin.py`
+  registers `quantization="liquidgemm"` (+ `vllm.general_plugins` entry point). Dedicated
+  venv `/share/venvs/vllm` (vLLM 0.25.1, torch 2.11+cu130). Two modes:
+  - **default (INT8/CUTLASS):** LiquidQuant weights as int8 through vLLM's
+    `cutlass_scaled_mm` — fast at all M, ~2× memory, CUDA-graph-safe. gemma-4-31B @ b30:
+    **1.74× bf16**, 31.7 vs 59 GiB.
+  - **`LIQUIDGEMM_W4=1` (RS-WGMMA, the paper's kernel):** true 4-bit in VRAM; in-register
+    dequant → INT8 WGMMA (`csrc/liquid_gemm/w4a8_wgmma.cu`, `w4a8_wgmma_rs`). Kernel
+    ~1.0–1.1× bf16 at M≥128 on H20 (qkv/gate_up), 4× less weight memory. Needs K%128, N%64.
+- **The paper's kernel is implemented** (RS WGMMA + in-register IMAD+XOR + fragment-order
+  4-bit prepack `repack_rs_weight` + register double-buffer dequant/MMA overlap). Remaining
+  perf refinements: split-K for M≤64 long-K, TMA loads, 2-CTA warp specialization.
+- ⚠️ **Async-proxy rule:** any kernel writing smem with regular stores that WGMMA then
+  reads via descriptors MUST issue `fence.proxy.async.shared::cta` — this was a real
+  timing-dependent race (only surfaced under GPU contention).
+- **RunPod fallback when the H20 box is busy** (tenant now occupies all 8 GPUs): 1× H100
+  SXM via REST API, key in `.env` (`RUNPOD_API_KEY`; also `HF_TOKEN` for gated Llama).
+  Create pod → ssh (PUBLIC_KEY env) → `bootstrap.sh` (uv venv, `vllm --torch-backend=cu128`
+  to match the image's nvcc 12.8, build sm_90a) → `bench/h100_run.sh`. **Terminate the pod
+  when done** (`DELETE /v1/pods/{id}`, ~$3/h).
 
 Build+test on the box (always GPU 6/7):
 ```

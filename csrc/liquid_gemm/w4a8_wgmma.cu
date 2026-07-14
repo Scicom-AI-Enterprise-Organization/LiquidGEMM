@@ -435,12 +435,15 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
   TORCH_CHECK(x_i8.is_cuda() && x_i8.dtype() == torch::kInt8);
   TORCH_CHECK(w.dtype() == torch::kUInt8 && group_size == 64);
   TORCH_CHECK(N % RS_BM == 0 && K % RS_BK == 0, "N%64==0 and K%128==0 required");
-  x_i8 = x_i8.contiguous();
   w = w.contiguous();
   const int M = x_i8.size(0);
-  TORCH_CHECK(M % RS_BN == 0, "M must be padded to a multiple of 64 (wrapper pads)");
+  // Pad tokens to the 64-token CTA tile inside the op (torch.compile-safe: callers pass
+  // any M; padded rows are zeros and are sliced off before returning).
+  const int Mp = (M + RS_BN - 1) / RS_BN * RS_BN;
+  x_i8 = (Mp == M) ? x_i8.contiguous()
+                   : torch::constant_pad_nd(x_i8, {0, 0, 0, Mp - M}, 0).contiguous();
   const int G = K / group_size;
-  auto c = torch::empty({M, (int)N}, torch::dtype(torch::kInt32).device(x_i8.device()));
+  auto c = torch::empty({Mp, (int)N}, torch::dtype(torch::kInt32).device(x_i8.device()));
 
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{},
                           make_shape(Int<RS_BN>{}, Int<RS_BK>{}, Int<2>{}));
@@ -450,7 +453,7 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
   TiledMMA mma = make_tiled_mma(RsMmaAtom{});
 
   const int smem_bytes = cosize_v<decltype(sB)> * (int)sizeof(int8_t);
-  dim3 grid((int)N / RS_BM, M / RS_BN);
+  dim3 grid((int)N / RS_BM, Mp / RS_BN);
   dim3 block(128);
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -458,19 +461,19 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
     auto kernel = &w4a8_wgmma_rs_device<true, decltype(sB), decltype(copyB), decltype(mma)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     kernel<<<grid, block, smem_bytes, stream>>>(
-        M, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
+        Mp, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
         s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(), c.data_ptr<int32_t>(), G,
         sB, copyB, mma);
   } else {
     auto kernel = &w4a8_wgmma_rs_device<false, decltype(sB), decltype(copyB), decltype(mma)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     kernel<<<grid, block, smem_bytes, stream>>>(
-        M, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
+        Mp, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
         s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(), c.data_ptr<int32_t>(), G,
         sB, copyB, mma);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return c;
+  return (Mp == M) ? c : c.narrow(0, 0, M);
 }
 
 // Stage 1: C[M,N] int32 = A[M,K] int8 @ B[N,K] int8^T  (TN, row-major inputs).

@@ -60,3 +60,21 @@ def test_rs_w4a8_wgmma_matches_reference(M, N, K, packed):
         x_i8, w, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, 64, packed)
     ref = torch._int_mm(x_i8, quant.dequantize_i8(qw).cuda().t().contiguous())
     assert torch.equal(got, ref), f"RS W4A8 WGMMA (packed={packed}) mismatch at {M}x{N}x{K}"
+
+
+@pytest.mark.skipif(not _HAVE, reason="extension not built")
+@pytest.mark.parametrize("M", [1, 30, 100])
+def test_rs_w4a8_wgmma_pads_odd_M(M):
+    """The op must accept any M (pads to 64 internally) — decode/concurrency shapes."""
+    from liquidgemm import quant, ops
+    torch.manual_seed(0)
+    N, K = 512, 4096
+    qw = quant.quantize_weight(torch.randn(N, K) * 0.05, 64)
+    w = ops.repack_rs_weight(qw).cuda()
+    x_i8 = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
+    got = torch.ops.liquidgemm.w4a8_wgmma_rs(
+        x_i8, w, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, 64, True)
+    assert got.shape == (M, N)
+    xp = torch.cat([x_i8, x_i8.new_zeros(64 - M % 64 if M % 64 else 0, K)], 0)
+    ref = torch._int_mm(xp, quant.dequantize_i8(qw).cuda().t().contiguous())[:M]
+    assert torch.equal(got.contiguous(), ref)

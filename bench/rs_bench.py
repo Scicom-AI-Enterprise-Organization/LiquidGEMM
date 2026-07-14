@@ -42,5 +42,8 @@ for name, N, K in LLAMA:
         xi = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
         tb = t(lambda: Xg @ Wg.t())
         tr = t(lambda: torch.ops.liquidgemm.w4a8_wgmma_rs(xi, rs, su8, off, N, K, 64, True))
-        ti = t(lambda: torch.ops.liquidgemm.wgmma_i8_gemm(xi, wi8))
-        print(f"  M={M:>4}: bf16 {tb*1e3:7.1f}us | RS-w4a8 {tr*1e3:7.1f}us ({tb/tr:.2f}x) | i8-wgmma {ti*1e3:7.1f}us ({tb/ti:.2f}x)")
+        line = f"  M={M:>4}: bf16 {tb*1e3:7.1f}us | RS-w4a8 {tr*1e3:7.1f}us ({tb/tr:.2f}x)"
+        if M % 128 == 0:  # Stage-1 i8 kernel requires M%128
+            ti = t(lambda: torch.ops.liquidgemm.wgmma_i8_gemm(xi, wi8))
+            line += f" | i8-wgmma {ti*1e3:7.1f}us ({tb/ti:.2f}x)"
+        print(line)

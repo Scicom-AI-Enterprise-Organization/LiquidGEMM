@@ -6,7 +6,8 @@ export PATH=/root/.local/bin:/usr/local/cuda/bin:$PATH
 export CUDA_HOME=/usr/local/cuda PYTHONPATH=/root/LiquidGEMM
 set -a; source .env; set +a           # HF_TOKEN for gated Llama
 source /root/venv/bin/activate
-MODEL=meta-llama/Llama-3.1-8B-Instruct
+# meta-llama repo is gated and this token isn't authorized -> ungated mirror (same weights)
+MODEL=NousResearch/Meta-Llama-3.1-8B-Instruct
 
 echo "=========== 1. KERNEL BENCH (RS vs bf16 vs int8-wgmma) ==========="
 python bench/rs_bench.py 2>&1
