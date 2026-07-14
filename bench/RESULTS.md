@@ -94,6 +94,33 @@ QServe/Marlin-level tuning work.
 Modes: default `quantization="liquidgemm"` (INT8/CUTLASS, fast, ~2× mem). Set
 `LIQUIDGEMM_W4=1` for the 4-bit custom-op path (~4× mem, best for pure decode).
 
+## The real paper's kernel — Hopper WGMMA (csrc/liquid_gemm/w4a8_wgmma.cu)
+
+Built with CuTe WGMMA atoms (`SM90_64x64x32_S32S8S8_SS_TN`, `Layout_K_SW128` swizzled
+smem, cp.async pipeline, warpgroup fence/commit/wait), hand-written mainloop + LiquidQuant
+dequant — the paper's design, not the CUTLASS collective it rejects. Both bit-exact vs
+reference. Latency vs cuBLAS bf16 (H20 GPU6, prefill/concurrency M):
+
+| shape | M | **int8 WGMMA** (Stage 1) | **fused W4A8 WGMMA** (4-bit, Stage 2/3) |
+|---|--:|--:|--:|
+| gate_up 28672←4096 | 128 | 1.23× | 0.73× |
+| gate_up | 256 | 1.62× | 0.74× |
+| gate_up | 512 | 1.61× | 0.80× |
+| qkv 6144←4096 | 512 | 1.08× | 0.69× |
+| down 4096←14336 | 512 | 1.37× | 0.55× |
+
+- **Stage 1 (int8 WGMMA): beats bf16 up to 1.62×** — the real tensor-core kernel works and
+  is fast. (This is what the production vLLM path effectively uses via CUTLASS.)
+- **Stage 2/3 (fused 4-bit → in-smem LiquidQuant dequant → WGMMA): correct, 0.55–0.80× bf16.**
+  Streams 4-bit from GMEM (4× weight memory) and runs real WGMMA. Double-buffered to overlap
+  dequant with WGMMA, but the ~16K swizzled-smem writes/tile for the dequant dominate and
+  can't be hidden.
+
+**To exceed bf16 with 4-bit weights** (the paper's full design): dequant in **registers**
+(RS WGMMA variant, `A`=weights operand via the `Y=(W·Xᵀ)ᵀ` layout) so the smem write
+vanishes, plus warp-specialized ImFP producer/consumer. That RS+ImFP step is the remaining
+kernel work; the SS version here proves the WGMMA + LiquidQuant-dequant datapath is correct.
+
 ## Reproduce
 ```
 CUDA_VISIBLE_DEVICES=6 python bench/microbench.py
