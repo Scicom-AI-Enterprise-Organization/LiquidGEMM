@@ -38,6 +38,21 @@ def _scale_epilogue_fake(acc, ascale, s1, out_dtype):
     return acc.new_empty(acc.shape, dtype=dt)
 
 
+@torch.library.register_fake("liquidgemm::wgmma_i8_gemm")
+def _wgmma_i8_gemm_fake(a, b):
+    return a.new_empty((a.shape[0], b.shape[0]), dtype=torch.int32)
+
+
+@torch.library.register_fake("liquidgemm::w4a8_wgmma")
+def _w4a8_wgmma_fake(x_i8, packed, s_u8, off_a, N, K, group_size):
+    return x_i8.new_empty((x_i8.shape[0], N), dtype=torch.int32)
+
+
+@torch.library.register_fake("liquidgemm::w4a8_wgmma_rs")
+def _w4a8_wgmma_rs_fake(x_i8, w, s_u8, off_a, N, K, group_size, packed):
+    return x_i8.new_empty((x_i8.shape[0], N), dtype=torch.int32)
+
+
 def dequant_weight_i8(qw: LiquidQuantWeight) -> torch.Tensor:
     """Reconstruct INT8 weights [N, K] on-device via the CUDA IMAD+XOR kernel."""
     return torch.ops.liquidgemm.dequant_weight(
@@ -101,6 +116,7 @@ def repack_rs_weight(qw: LiquidQuantWeight) -> torch.Tensor:
     N, K = qw.N, qw.K
     RB, KT = N // 64, K // 128
     q = qw.qweight_u4.view(RB, 64, KT, 128).permute(0, 2, 1, 3)  # [RB, KT, 64rows, 128k]
+    m, k = m.to(q.device), k.to(q.device)
     out = q[:, :, m, k]                                          # [RB, KT, 128thr, 64elem]
     packed = (out[..., 0::2] | (out[..., 1::2] << 4)).to(torch.uint8)
     return packed.contiguous()                                   # [RB, KT, 128, 32]

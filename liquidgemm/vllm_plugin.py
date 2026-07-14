@@ -119,8 +119,10 @@ class LiquidGemmLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         W = layer.weight.data  # [out, in], bf16, on device
         g = self.cfg.group_size
-        if W.shape[1] % g != 0:
-            # non-group-aligned (e.g. some vision/proj layers) -> keep bf16.
+        # RS-WGMMA needs K%128 and N%64; int8 path needs K%group. Fall back to bf16 else.
+        aligned = (W.shape[1] % 128 == 0 and W.shape[0] % 64 == 0) if self.cfg.w4 \
+            else (W.shape[1] % g == 0)
+        if not aligned:
             layer.lq_enabled = False
             layer.weight = torch.nn.Parameter(W, requires_grad=False)
             return
@@ -129,9 +131,10 @@ class LiquidGemmLinearMethod(LinearMethodBase):
         layer.lq_enabled = True
         layer.lq_N, layer.lq_K = qw.N, qw.K
         if self.cfg.w4:
-            # 4-bit storage (~4x memory win); custom w4a8_gemm op runs at all M.
+            # True 4-bit storage (~4x memory win): RS-WGMMA fragment-order pack.
+            # In-register dequant feeds INT8 WGMMA directly (the LiquidGEMM datapath).
             layer.register_buffer("lq_s1", qw.s1.to(dev))              # [N]
-            layer.register_buffer("lq_packed", pack_nibbles(qw.qweight_u4).to(dev))
+            layer.register_buffer("lq_rs", ops.repack_rs_weight(qw).to(dev))
             layer.register_buffer("lq_s_u8", qw.s_u8.to(dev))
             layer.register_buffer("lq_offset_a", qw.offset_a.to(dev))
         else:
@@ -153,11 +156,18 @@ class LiquidGemmLinearMethod(LinearMethodBase):
         N = layer.lq_N
 
         if self.cfg.w4:
-            # 4-bit weights, fused custom op at all M (CUDA-graph-safe, ~4x memory).
+            # True 4-bit weights via RS-WGMMA (in-register dequant -> INT8 tensor cores).
+            # Pad tokens to the 64-token CTA tile; CUDA-graph-safe (static shapes).
             x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)
-            y = torch.ops.liquidgemm.w4a8_gemm(
-                x_i8, layer.lq_packed, layer.lq_s_u8, layer.lq_offset_a, layer.lq_s1,
-                ascale, N, layer.lq_K, self.cfg.group_size).to(x.dtype)
+            M = x_i8.shape[0]
+            pad = (-M) % 64
+            if pad:
+                x_i8 = torch.cat([x_i8, x_i8.new_zeros(pad, layer.lq_K)], 0)
+            acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
+                x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_offset_a,
+                N, layer.lq_K, self.cfg.group_size, True)[:M]
+            odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
+            y = torch.ops.liquidgemm.scale_epilogue(acc, ascale, layer.lq_s1, odt)
         else:
             # Production path: vLLM's fused per-token INT8 quant + CUTLASS INT8 GEMM
             # (cutlass_scaled_mm). Fast at all M, CUDA-graph-safe, fused scale+bias epilogue.

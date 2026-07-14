@@ -177,11 +177,16 @@ w4a8_wgmma_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     }
   };
 
+  // Generic-proxy smem writes (the dequant stores) must be made visible to the async
+  // proxy (WGMMA smem descriptor reads) — otherwise a timing-dependent race.
+  auto fence_proxy = [] { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); };
+
   // Prologue: fill buffer 0.
   copy(copy_a, tAgA(_, _, _, 0), tAsA(_, _, _, 0));
   cp_async_fence();
   dequant_tile(0, 0);
   cp_async_wait<0>();
+  fence_proxy();
   __syncthreads();
 
   // Software-pipelined mainloop: issue WGMMA (async, tensor cores) on the current buffer,
@@ -199,6 +204,7 @@ w4a8_wgmma_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
       cp_async_fence();
       cp_async_wait<0>();
       dequant_tile(kt + 1, nxt);   // overlaps the in-flight WGMMA above
+      fence_proxy();               // make dequant stores visible to WGMMA's async proxy
     }
 
     warpgroup_wait<0>();
