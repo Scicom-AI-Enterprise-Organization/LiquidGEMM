@@ -13,6 +13,31 @@ from .quant import LiquidQuantWeight
 from .pack import pack_nibbles
 
 
+# Fake/meta implementations so the ops are torch.compile / CUDA-graph capturable
+# (lets vLLM run WITHOUT enforce_eager, amortizing per-layer launch overhead).
+@torch.library.register_fake("liquidgemm::dequant_weight")
+def _dequant_weight_fake(qweight, s_u8, offset_a, N, K, group_size):
+    return qweight.new_empty((N, K), dtype=torch.int8)
+
+
+@torch.library.register_fake("liquidgemm::w4a8_gemm")
+def _w4a8_gemm_fake(X, qweight, s_u8, offset_a, s1, ascale, N, K, group_size):
+    return X.new_empty((X.shape[0], N), dtype=torch.float32)
+
+
+@torch.library.register_fake("liquidgemm::quant_per_token")
+def _quant_per_token_fake(x):
+    M, K = x.shape
+    return (x.new_empty((M, K), dtype=torch.int8),
+            x.new_empty((M,), dtype=torch.float32))
+
+
+@torch.library.register_fake("liquidgemm::scale_epilogue")
+def _scale_epilogue_fake(acc, ascale, s1, out_dtype):
+    dt = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[int(out_dtype)]
+    return acc.new_empty(acc.shape, dtype=dt)
+
+
 def dequant_weight_i8(qw: LiquidQuantWeight) -> torch.Tensor:
     """Reconstruct INT8 weights [N, K] on-device via the CUDA IMAD+XOR kernel."""
     return torch.ops.liquidgemm.dequant_weight(

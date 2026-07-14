@@ -45,9 +45,13 @@ def register():
 
 @register_quantization_config("liquidgemm")
 class LiquidGemmConfig(QuantizationConfig):
-    def __init__(self, group_size: int = 64):
+    def __init__(self, group_size: int = 64, keep_w4: bool = False):
         super().__init__()
         self.group_size = group_size
+        # keep_w4=True also stores 4-bit weights and uses the fused GEMV for M<=16 decode
+        # (4x weight-memory, best decode bandwidth). Default False: store INT8 only and use
+        # cuBLASLt INT8 tensor cores at all M (2x memory, best throughput at concurrency).
+        self.keep_w4 = keep_w4
 
     @classmethod
     def get_name(cls) -> str:
@@ -67,7 +71,8 @@ class LiquidGemmConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "LiquidGemmConfig":
-        return cls(group_size=int(config.get("group_size", 64)))
+        return cls(group_size=int(config.get("group_size", 64)),
+                   keep_w4=bool(config.get("keep_w4", False)))
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -108,18 +113,25 @@ class LiquidGemmLinearMethod(LinearMethodBase):
         W = layer.weight.data  # [out, in], bf16, on device
         g = self.cfg.group_size
         if W.shape[1] % g != 0:
-            # fall back to bf16 for non-group-aligned layers
+            # non-group-aligned (e.g. some vision/proj layers) -> keep bf16.
             layer.lq_enabled = False
             layer.weight = torch.nn.Parameter(W, requires_grad=False)
             return
         qw = quantize_weight(W.float(), group_size=g)
         dev = W.device
         layer.lq_enabled = True
-        layer.register_buffer("lq_packed", pack_nibbles(qw.qweight_u4).to(dev))
-        layer.register_buffer("lq_s_u8", qw.s_u8.to(dev))
-        layer.register_buffer("lq_offset_a", qw.offset_a.to(dev))
-        layer.register_buffer("lq_s1", qw.s1.to(dev))
         layer.lq_N, layer.lq_K = qw.N, qw.K
+        # LiquidQuant reconstructed INT8 weights (== W4 values), stored [K, N] for cuBLASLt.
+        w_i8 = torch.ops.liquidgemm.dequant_weight(
+            qw.qweight_u4.to(dev), qw.s_u8.to(dev), qw.offset_a.to(dev),
+            qw.N, qw.K, g)                        # [N, K] int8
+        layer.register_buffer("lq_w_i8_t", w_i8.t().contiguous())  # [K, N]
+        layer.register_buffer("lq_s1", qw.s1.to(dev))
+        if self.cfg.keep_w4:
+            # optional: also keep 4-bit packed for the memory-optimal decode GEMV path.
+            layer.register_buffer("lq_packed", pack_nibbles(qw.qweight_u4).to(dev))
+            layer.register_buffer("lq_s_u8", qw.s_u8.to(dev))
+            layer.register_buffer("lq_offset_a", qw.offset_a.to(dev))
         del layer.weight  # free the bf16 copy
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor,
@@ -128,12 +140,23 @@ class LiquidGemmLinearMethod(LinearMethodBase):
             y = torch.nn.functional.linear(x, layer.weight)
             return y if bias is None else y + bias
         shape = x.shape
-        x2 = x.reshape(-1, shape[-1])
-        s = (x2.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1e-8)
-        x_i8 = torch.round(x2 / s).clamp_(-127, 127).to(torch.int8).contiguous()
-        ascale = s.squeeze(-1).float().contiguous()
-        y = torch.ops.liquidgemm.w4a8_gemm(
-            x_i8, layer.lq_packed, layer.lq_s_u8, layer.lq_offset_a, layer.lq_s1,
-            ascale, layer.lq_N, layer.lq_K, self.cfg.group_size)
-        y = y.to(x.dtype).reshape(*shape[:-1], layer.lq_N)
+        x2 = x.reshape(-1, shape[-1]).contiguous()
+        M, K, N = x2.shape[0], layer.lq_K, layer.lq_N
+        odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
+        x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)   # 1 fused kernel
+
+        if self.cfg.keep_w4 and M <= 16:
+            # Memory-bound decode: fused 4-bit GEMV (streams 4-bit weights from GMEM).
+            y = torch.ops.liquidgemm.w4a8_gemm(
+                x_i8, layer.lq_packed, layer.lq_s_u8, layer.lq_offset_a, layer.lq_s1,
+                ascale, N, K, self.cfg.group_size).to(x.dtype)
+        else:
+            # Concurrency / prefill: INT8 tensor cores (cuBLASLt) + fused scale epilogue.
+            # torch._int_mm requires M>16; pad small M (low-concurrency decode).
+            if M <= 16:
+                x_i8 = torch.cat([x_i8, x_i8.new_zeros(17 - M, K)], 0)
+            acc = torch._int_mm(x_i8, layer.lq_w_i8_t)            # [M(+pad), N] int32
+            acc = acc[:M]
+            y = torch.ops.liquidgemm.scale_epilogue(acc, ascale, layer.lq_s1, odt)  # 1 kernel
+        y = y.reshape(*shape[:-1], N)
         return y if bias is None else y + bias

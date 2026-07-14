@@ -23,6 +23,7 @@ setup(
                 "csrc/liquid_gemm/torch_bindings.cpp",
                 "csrc/liquid_gemm/dequant.cu",
                 "csrc/liquid_gemm/w4a8_gemm.cu",
+                "csrc/liquid_gemm/epilogue.cu",
             ],
             include_dirs=[os.path.join(CUTLASS_DIR, "include")],
             extra_compile_args={

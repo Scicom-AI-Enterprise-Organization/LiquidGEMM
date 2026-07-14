@@ -12,10 +12,11 @@ def main():
     ap.add_argument("--quant", default="liquidgemm", help="liquidgemm | none")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--out-len", type=int, default=256)
+    ap.add_argument("--eager", type=int, default=1, help="1=enforce_eager, 0=cuda graphs")
     args = ap.parse_args()
 
-    kw = dict(enforce_eager=True, gpu_memory_utilization=0.6, max_model_len=2048,
-              dtype="bfloat16", seed=0)
+    kw = dict(enforce_eager=bool(args.eager), gpu_memory_utilization=0.6,
+              max_model_len=2048, dtype="bfloat16", seed=0)
     if args.quant != "none":
         kw["quantization"] = args.quant
     llm = LLM(args.model, **kw)
