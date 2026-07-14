@@ -93,6 +93,128 @@ wgmma_i8_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   copy(tCrC, tCgC);
 }
 
+// ---- Stage 2: fused W4A8 WGMMA. 4-bit weights streamed from GMEM, dequantized
+// (LiquidQuant IMAD+XOR) into the swizzled WGMMA smem operand, INT8 WGMMA, INT32 out.
+// Correctness-first (single-stage: load -> dequant -> wgmma per K-tile). ----
+template <class ProblemShape, class CtaTiler,
+          class AStride, class ASmemLayout, class TiledCopyA,
+          class BSmemLayout, class TiledMma>
+__global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void
+w4a8_wgmma_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
+                  int8_t const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a,
+                  uint8_t const* Bpacked, BSmemLayout sB_layout,
+                  uint8_t const* s_u8, uint8_t const* off_a, int32_t* C, int G) {
+  using namespace cute;
+  int M = size<0>(shape_MNK), N = size<1>(shape_MNK), K = size<2>(shape_MNK);
+  auto BM = size<0>(cta_tiler), BN = size<1>(cta_tiler), BK = size<2>(cta_tiler);
+  int Kh = K >> 1;
+
+  Tensor mA = make_tensor(make_gmem_ptr(A), select<0, 2>(shape_MNK), dA);
+  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
+  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});  // (BM,BK,k)
+
+  extern __shared__ char smem_raw[];
+  int8_t* smemA = reinterpret_cast<int8_t*>(smem_raw);
+  int8_t* smemB = smemA + cosize_v<ASmemLayout>;
+  Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);           // (BM,BK)
+  Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);           // (BN,BK)
+
+  ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tAsA = thr_copy_a.partition_D(as_position_independent_swizzle_tensor(sA));
+
+  TiledMma mma;
+  ThrMMA thr_mma = mma.get_slice(threadIdx.x);
+  Tensor tCsA = thr_mma.partition_A(sA);
+  Tensor tCsB = thr_mma.partition_B(sB);
+  Tensor gC = local_tile(make_tensor(make_gmem_ptr(C), select<0, 1>(shape_MNK),
+                                     make_stride(N, Int<1>{})),
+                         cta_tiler, cta_coord, Step<_1, _1, X>{});    // (BM,BN)
+  Tensor tCgC = thr_mma.partition_C(gC);
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);
+  Tensor tCrB = thr_mma.make_fragment_B(tCsB);
+  Tensor tCrC = thr_mma.make_fragment_C(tCgC);
+  clear(tCrC);
+
+  const int n0 = blockIdx.y * BN;
+  const int bk = BK;  // 128
+  int K_TILES = K / bk;
+
+  for (int kt = 0; kt < K_TILES; ++kt) {
+    // A: cp.async int8 tile -> swizzled sA
+    copy(copy_a, tAgA(_, _, _, kt), tAsA);
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();
+
+    // B: dequant 4-bit -> swizzled sB (LiquidQuant IMAD+XOR), per-group scale/offset.
+    const int k0 = kt * bk;
+    for (int i = threadIdx.x; i < BN * bk; i += blockDim.x) {
+      int n = i / bk, k = i - n * bk;
+      int gn = n0 + n;
+      int gk = k0 + k;
+      int g = gk / 64;                                   // group (group_size=64)
+      uint32_t s = s_u8[gn * G + g];
+      uint32_t a = off_a[gn * G + g];
+      uint8_t pb = Bpacked[gn * Kh + (gk >> 1)];
+      uint32_t nib = (gk & 1) ? (pb >> 4) : (pb & 0xF);
+      int8_t qhat = (int8_t)(((nib * s + a) ^ 0x80u) & 0xFF);
+      sB(n, k) = qhat;                                   // CuTe applies the swizzle
+    }
+    __syncthreads();
+
+    warpgroup_fence_operand(tCrC);
+    warpgroup_arrive();
+    cute::gemm(mma, tCrA, tCrB, tCrC);
+    warpgroup_commit_batch();
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(tCrC);
+    __syncthreads();
+  }
+  copy(tCrC, tCgC);  // write INT32 accumulators; scaling done by scale_epilogue
+}
+
+torch::Tensor w4a8_wgmma(torch::Tensor x_i8, torch::Tensor packed, torch::Tensor s_u8,
+                         torch::Tensor off_a, int64_t N, int64_t K, int64_t group_size) {
+  TORCH_CHECK(x_i8.is_cuda() && x_i8.dtype() == torch::kInt8);
+  TORCH_CHECK(packed.dtype() == torch::kUInt8 && group_size == 64);
+  x_i8 = x_i8.contiguous();
+  packed = packed.contiguous();
+  int M = x_i8.size(0);
+  TORCH_CHECK(M % 128 == 0 && N % 128 == 0 && K % 128 == 0,
+              "Stage-2 WGMMA requires M,N,K multiples of 128 (pad callers)");
+  int G = K / group_size;
+  auto c = torch::empty({M, (int)N}, torch::dtype(torch::kInt32).device(x_i8.device()));
+
+  auto prob = make_shape(M, (int)N, (int)K);
+  auto dA = make_stride((int)K, Int<1>{});
+  auto bM = Int<128>{};
+  auto bN = Int<128>{};
+  auto bK = Int<128>{};
+  auto cta = make_shape(bM, bN, bK);
+  auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{}, make_shape(bM, bK));
+  auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{}, make_shape(bN, bK));
+  TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>{},
+                                    Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+                                    Layout<Shape<_1, _16>>{});
+  TiledMMA mma = make_tiled_mma(SM90_64x64x32_S32S8S8_SS_TN{});
+
+  int smem_bytes = (cosize_v<decltype(sA)> + cosize_v<decltype(sB)>) * (int)sizeof(int8_t);
+  dim3 grid(ceil_div(M, (int)bM), ceil_div((int)N, (int)bN));
+  dim3 block(size(mma));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto kernel = &w4a8_wgmma_device<decltype(prob), decltype(cta),
+                                   decltype(dA), decltype(sA), decltype(copyA),
+                                   decltype(sB), decltype(mma)>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  kernel<<<grid, block, smem_bytes, stream>>>(
+      prob, cta, x_i8.data_ptr<int8_t>(), dA, sA, copyA,
+      packed.data_ptr<uint8_t>(), sB, s_u8.data_ptr<uint8_t>(),
+      off_a.data_ptr<uint8_t>(), c.data_ptr<int32_t>(), G);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return c;
+}
+
 // Stage 1: C[M,N] int32 = A[M,K] int8 @ B[N,K] int8^T  (TN, row-major inputs).
 torch::Tensor wgmma_i8_gemm(torch::Tensor a, torch::Tensor b) {
   TORCH_CHECK(a.is_cuda() && b.is_cuda() && a.dtype() == torch::kInt8 && b.dtype() == torch::kInt8);

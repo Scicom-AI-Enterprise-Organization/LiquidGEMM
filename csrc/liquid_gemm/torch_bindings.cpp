@@ -17,6 +17,9 @@ std::vector<torch::Tensor> quant_per_token(torch::Tensor x);
 
 torch::Tensor wgmma_i8_gemm(torch::Tensor a, torch::Tensor b);
 
+torch::Tensor w4a8_wgmma(torch::Tensor x_i8, torch::Tensor packed, torch::Tensor s_u8,
+                         torch::Tensor off_a, int64_t N, int64_t K, int64_t group_size);
+
 torch::Tensor scale_epilogue(torch::Tensor acc, torch::Tensor ascale, torch::Tensor s1,
                              int64_t out_dtype);
 
@@ -32,6 +35,7 @@ TORCH_LIBRARY(liquidgemm, m) {
   m.def("quant_per_token(Tensor x) -> Tensor[]");
   m.def("scale_epilogue(Tensor acc, Tensor ascale, Tensor s1, int out_dtype) -> Tensor");
   m.def("wgmma_i8_gemm(Tensor a, Tensor b) -> Tensor");
+  m.def("w4a8_wgmma(Tensor x_i8, Tensor packed, Tensor s_u8, Tensor off_a, int N, int K, int group_size) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(liquidgemm, CUDA, m) {
@@ -40,6 +44,7 @@ TORCH_LIBRARY_IMPL(liquidgemm, CUDA, m) {
   m.impl("quant_per_token", &liquidgemm::quant_per_token);
   m.impl("scale_epilogue", &liquidgemm::scale_epilogue);
   m.impl("wgmma_i8_gemm", &liquidgemm::wgmma_i8_gemm);
+  m.impl("w4a8_wgmma", &liquidgemm::w4a8_wgmma);
 }
 
 // Empty module so `import liquidgemm._C` succeeds; the TORCH_LIBRARY static initializers

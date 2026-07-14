@@ -23,3 +23,19 @@ def test_wgmma_i8_matches_int_mm(M, N, K):
     got = torch.ops.liquidgemm.wgmma_i8_gemm(a, b)
     ref = torch._int_mm(a, b.t().contiguous())
     assert torch.equal(got, ref), f"WGMMA int8 mismatch at {M}x{N}x{K}"
+
+
+@pytest.mark.skipif(not _HAVE, reason="extension not built")
+@pytest.mark.parametrize("M,N,K", SHAPES)
+def test_fused_w4a8_wgmma_matches_reference(M, N, K):
+    """Fused 4-bit dequant + WGMMA int32 accumulation == reference."""
+    from liquidgemm import quant
+    from liquidgemm.pack import pack_nibbles
+    torch.manual_seed(0)
+    W = torch.randn(N, K) * 0.05
+    qw = quant.quantize_weight(W, 64)
+    packed = pack_nibbles(qw.qweight_u4).cuda().contiguous()
+    x_i8 = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
+    got = torch.ops.liquidgemm.w4a8_wgmma(x_i8, packed, qw.s_u8.cuda(), qw.offset_a.cuda(), N, K, 64)
+    ref = torch._int_mm(x_i8, quant.dequantize_i8(qw).cuda().t().contiguous())
+    assert torch.equal(got, ref), f"fused W4A8 WGMMA mismatch at {M}x{N}x{K}"
