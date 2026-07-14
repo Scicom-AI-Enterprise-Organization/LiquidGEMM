@@ -137,33 +137,25 @@ w4a8_wgmma_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                                      make_stride(N, Int<1>{})),
                          cta_tiler, cta_coord, Step<_1, _1, X>{});    // (BM,BN)
   Tensor tCgC = thr_mma.partition_C(gC);
-  Tensor tCrA = thr_mma.make_fragment_A(tCsA);
-  Tensor tCrB = thr_mma.make_fragment_B(tCsB);
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);   // (MMA,MMA_M,MMA_K,PIPE)
+  Tensor tCrB = thr_mma.make_fragment_B(tCsB);   // (MMA,MMA_N,MMA_K,PIPE)
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);
   clear(tCrC);
 
   const int n0 = blockIdx.y * BN;
   const int bk = BK;  // 128
-  int K_TILES = K / bk;
+  const int K_TILES = K / bk;
+  const int chunks_per_row = bk / 32;              // 32 weights (16 packed bytes) / chunk
+  const int n_chunks = BN * chunks_per_row;
 
-  for (int kt = 0; kt < K_TILES; ++kt) {
-    // A: cp.async int8 tile -> swizzled sA
-    copy(copy_a, tAgA(_, _, _, kt), tAsA);
-    cp_async_fence();
-    cp_async_wait<0>();
-    __syncthreads();
-
-    // B: dequant 4-bit -> swizzled sB. Coalesced 128-bit packed loads + 4-lane SIMD
-    // LiquidQuant dequant (IMAD+XOR), one scale/offset load per 32 weights (1 group).
+  // Dequant one K-tile of 4-bit weights into sB[buf] (coalesced 128-bit loads + 4-lane
+  // SIMD LiquidQuant IMAD+XOR; one group scale/offset per 32 weights).
+  auto dequant_tile = [&](int kt, int buf) {
     const int k0 = kt * bk;
-    const int chunks_per_row = bk / 32;                  // 32 weights (16 packed bytes)/chunk
-    const int n_chunks = BN * chunks_per_row;
     for (int c = threadIdx.x; c < n_chunks; c += blockDim.x) {
       int n = c / chunks_per_row;
-      int kc = (c - n * chunks_per_row) * 32;            // k within tile (mult of 32)
-      int gn = n0 + n;
-      int gk = k0 + kc;
-      int g = gk >> 6;                                   // group (32 weights stay in 1 group)
+      int kc = (c - n * chunks_per_row) * 32;
+      int gn = n0 + n, gk = k0 + kc, g = gk >> 6;
       uint32_t s = s_u8[gn * G + g];
       uint32_t a_word = (uint32_t)off_a[gn * G + g] * 0x01010101u;
       const uint4 pkv = *reinterpret_cast<const uint4*>(&Bpacked[gn * Kh + (gk >> 1)]);
@@ -173,22 +165,42 @@ w4a8_wgmma_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         uint32_t lo = (wg_expand2(pk[i] & 0xFFFF) * s + a_word) ^ 0x80808080u;
         uint32_t hi = (wg_expand2(pk[i] >> 16) * s + a_word) ^ 0x80808080u;
         int base = kc + 8 * i;
-        sB(n, base + 0) = (int8_t)(lo & 0xFF);
-        sB(n, base + 1) = (int8_t)((lo >> 8) & 0xFF);
-        sB(n, base + 2) = (int8_t)((lo >> 16) & 0xFF);
-        sB(n, base + 3) = (int8_t)((lo >> 24) & 0xFF);
-        sB(n, base + 4) = (int8_t)(hi & 0xFF);
-        sB(n, base + 5) = (int8_t)((hi >> 8) & 0xFF);
-        sB(n, base + 6) = (int8_t)((hi >> 16) & 0xFF);
-        sB(n, base + 7) = (int8_t)((hi >> 24) & 0xFF);
+        sB(n, base + 0, buf) = (int8_t)(lo & 0xFF);
+        sB(n, base + 1, buf) = (int8_t)((lo >> 8) & 0xFF);
+        sB(n, base + 2, buf) = (int8_t)((lo >> 16) & 0xFF);
+        sB(n, base + 3, buf) = (int8_t)((lo >> 24) & 0xFF);
+        sB(n, base + 4, buf) = (int8_t)(hi & 0xFF);
+        sB(n, base + 5, buf) = (int8_t)((hi >> 8) & 0xFF);
+        sB(n, base + 6, buf) = (int8_t)((hi >> 16) & 0xFF);
+        sB(n, base + 7, buf) = (int8_t)((hi >> 24) & 0xFF);
       }
     }
-    __syncthreads();
+  };
 
+  // Prologue: fill buffer 0.
+  copy(copy_a, tAgA(_, _, _, 0), tAsA(_, _, _, 0));
+  cp_async_fence();
+  dequant_tile(0, 0);
+  cp_async_wait<0>();
+  __syncthreads();
+
+  // Software-pipelined mainloop: issue WGMMA (async, tensor cores) on the current buffer,
+  // then load+dequant the NEXT tile (CUDA cores) into the other buffer so the two overlap
+  // (the ImFP idea, via double-buffering rather than warp specialization).
+  for (int kt = 0; kt < K_TILES; ++kt) {
+    int cur = kt & 1, nxt = (kt + 1) & 1;
     warpgroup_fence_operand(tCrC);
     warpgroup_arrive();
-    cute::gemm(mma, tCrA, tCrB, tCrC);
+    cute::gemm(mma, tCrA(_, _, _, cur), tCrB(_, _, _, cur), tCrC);
     warpgroup_commit_batch();
+
+    if (kt + 1 < K_TILES) {
+      copy(copy_a, tAgA(_, _, _, kt + 1), tAsA(_, _, _, nxt));
+      cp_async_fence();
+      cp_async_wait<0>();
+      dequant_tile(kt + 1, nxt);   // overlaps the in-flight WGMMA above
+    }
+
     warpgroup_wait<0>();
     warpgroup_fence_operand(tCrC);
     __syncthreads();
@@ -213,9 +225,10 @@ torch::Tensor w4a8_wgmma(torch::Tensor x_i8, torch::Tensor packed, torch::Tensor
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int<128>{};
+  auto bP = Int<2>{};   // double-buffer for dequant/WGMMA overlap
   auto cta = make_shape(bM, bN, bK);
-  auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{}, make_shape(bM, bK));
-  auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{}, make_shape(bN, bK));
+  auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{}, make_shape(bM, bK, bP));
+  auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{}, make_shape(bN, bK, bP));
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>{},
                                     Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                     Layout<Shape<_1, _16>>{});
