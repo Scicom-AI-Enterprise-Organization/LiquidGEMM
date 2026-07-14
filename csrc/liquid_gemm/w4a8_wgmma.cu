@@ -16,6 +16,12 @@ using namespace cute;
 
 namespace liquidgemm {
 
+// two packed bytes (4 nibbles) -> uint32 with one UINT4 per byte lane, weight order.
+__device__ __forceinline__ uint32_t wg_expand2(uint32_t h) {
+  uint32_t b0 = h & 0xFF, b1 = (h >> 8) & 0xFF;
+  return (b0 & 0xF) | ((b0 >> 4) << 8) | ((b1 & 0xF) << 16) | ((b1 >> 4) << 24);
+}
+
 template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class TiledCopyA,
           class TB, class BStride, class BSmemLayout, class TiledCopyB,
@@ -147,19 +153,35 @@ w4a8_wgmma_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     cp_async_wait<0>();
     __syncthreads();
 
-    // B: dequant 4-bit -> swizzled sB (LiquidQuant IMAD+XOR), per-group scale/offset.
+    // B: dequant 4-bit -> swizzled sB. Coalesced 128-bit packed loads + 4-lane SIMD
+    // LiquidQuant dequant (IMAD+XOR), one scale/offset load per 32 weights (1 group).
     const int k0 = kt * bk;
-    for (int i = threadIdx.x; i < BN * bk; i += blockDim.x) {
-      int n = i / bk, k = i - n * bk;
+    const int chunks_per_row = bk / 32;                  // 32 weights (16 packed bytes)/chunk
+    const int n_chunks = BN * chunks_per_row;
+    for (int c = threadIdx.x; c < n_chunks; c += blockDim.x) {
+      int n = c / chunks_per_row;
+      int kc = (c - n * chunks_per_row) * 32;            // k within tile (mult of 32)
       int gn = n0 + n;
-      int gk = k0 + k;
-      int g = gk / 64;                                   // group (group_size=64)
+      int gk = k0 + kc;
+      int g = gk >> 6;                                   // group (32 weights stay in 1 group)
       uint32_t s = s_u8[gn * G + g];
-      uint32_t a = off_a[gn * G + g];
-      uint8_t pb = Bpacked[gn * Kh + (gk >> 1)];
-      uint32_t nib = (gk & 1) ? (pb >> 4) : (pb & 0xF);
-      int8_t qhat = (int8_t)(((nib * s + a) ^ 0x80u) & 0xFF);
-      sB(n, k) = qhat;                                   // CuTe applies the swizzle
+      uint32_t a_word = (uint32_t)off_a[gn * G + g] * 0x01010101u;
+      const uint4 pkv = *reinterpret_cast<const uint4*>(&Bpacked[gn * Kh + (gk >> 1)]);
+      const uint32_t pk[4] = {pkv.x, pkv.y, pkv.z, pkv.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        uint32_t lo = (wg_expand2(pk[i] & 0xFFFF) * s + a_word) ^ 0x80808080u;
+        uint32_t hi = (wg_expand2(pk[i] >> 16) * s + a_word) ^ 0x80808080u;
+        int base = kc + 8 * i;
+        sB(n, base + 0) = (int8_t)(lo & 0xFF);
+        sB(n, base + 1) = (int8_t)((lo >> 8) & 0xFF);
+        sB(n, base + 2) = (int8_t)((lo >> 16) & 0xFF);
+        sB(n, base + 3) = (int8_t)((lo >> 24) & 0xFF);
+        sB(n, base + 4) = (int8_t)(hi & 0xFF);
+        sB(n, base + 5) = (int8_t)((hi >> 8) & 0xFF);
+        sB(n, base + 6) = (int8_t)((hi >> 16) & 0xFF);
+        sB(n, base + 7) = (int8_t)((hi >> 24) & 0xFF);
+      }
     }
     __syncthreads();
 
