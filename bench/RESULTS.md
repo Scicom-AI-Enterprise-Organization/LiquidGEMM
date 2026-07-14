@@ -60,6 +60,19 @@ Throughput (tokens/s), CUDA graphs (vLLM default) unless noted:
 | LiquidGEMM — INT8 via torch._int_mm, eager | 34.8 | 1035 | 3.26 GiB | superseded (overhead) |
 | LiquidGEMM — 4-bit custom op (`w4=True`) | works | slow (dp4a) | 2.0 GiB | ~4× mem, decode-only |
 
+**Big model at production concurrency — gemma-4-31B-it, batch 30, out=128, CUDA graphs:**
+
+| config | throughput | weight mem |
+|---|---:|---:|
+| bf16 | 540 tok/s | 59.0 GiB |
+| **LiquidGEMM (INT8/CUTLASS)** | **938 tok/s (1.74×)** | **31.7 GiB (1.86× less)** |
+
+On a 31B model the linear GEMMs dominate, so INT8's compute + halved weight bytes give a
+clear **1.74× throughput win** plus ~1.9× memory headroom (more KV / larger batch). NOTE:
+default stores **INT8** weights (1 byte) → 31.7 GiB, not 4-bit; the CUTLASS INT8 kernel
+consumes int8 operands. `LIQUIDGEMM_W4=1` keeps true 4-bit (~16 GiB) but uses the slow
+custom kernel. Getting 4-bit memory *and* this speed is the fused-WGMMA task (#7).
+
 **Default path = production-ready.** LiquidQuant weights are stored INT8 and run through
 vLLM's own CUTLASS INT8 GEMM (`cutlass_scaled_mm`) + fused per-token int8 quant
 (`scaled_int8_quant`). It is **CUDA-graph-safe**, fast at all M, and reaches **~0.75× of
