@@ -114,16 +114,25 @@ Full plan: `/Users/husein.z/.claude/plans/functional-orbiting-kite.md`.
 - **D0 done** — scaffold, remote env (`/share/venvs/liquidgemm`), rsync side-loaded, refs cloned.
 - **Phase 1 done** — `liquidgemm/quant.py` + `pack.py`, 33 tests green (XOR trick, overflow
   invariants, 4-lane SIMD dequant, quant quality). Verified against QServe's actual scheme.
-- **Phase 2 in progress:**
+- **Phase 2 done (dp4a) / Phase 3 done:**
   - ✅ CUDA extension builds on CUDA 13 / torch 2.9 / sm_90a (`setup.py`, `csrc/liquid_gemm/`).
-  - ✅ `torch.ops.liquidgemm.dequant_weight` (IMAD+XOR) — bit-exact vs reference (10 tests).
-  - ✅ `ops.w4a8_linear_unfused` correctness oracle (dequant → `torch._int_mm` → scale) —
-    end-to-end numerics validated at all M incl. decode (20 tests). NOTE: `torch._int_mm`
-    needs M>16, so it pads; also it's unfused (extra GMEM traffic) → NOT the deliverable.
-  - ⏭️ **NEXT: the fused kernel.** (a) correctness-first tiled int8 GEMM with in-register
-    LiquidQuant dequant using `mma.sync.m16n8k32.s8` (mirror QServe's mainloop, swap dequant);
-    (b) upgrade to WGMMA + TMA + ImFP (1 Load WG + 2 Compute WGs) for the H20 perf win;
-    (c) expose as `torch.ops.liquidgemm.w4a8_gemm`. Verify each step vs `quant.w4a8_matmul`.
+  - ✅ `torch.ops.liquidgemm.dequant_weight` (IMAD+XOR) — bit-exact vs reference.
+  - ✅ `torch.ops.liquidgemm.w4a8_gemm` — **fused**: 4-bit weights from GMEM, in-register
+    dequant, dp4a. Warp-per-column GEMV (M≤16) + tiled (M>16). Verified vs reference.
+  - ✅ `ops.w4a8_linear_unfused` oracle (dequant → `torch._int_mm` → scale). 63 tests green.
+  - ✅ Microbench (`bench/microbench.py`) + **accuracy** (`bench/accuracy.py`). See
+    `bench/RESULTS.md`: decode M=1 ≈ **1.0–1.17× cuBLAS bf16** (~800–910 GB/s); LiquidQuant
+    W4 ppl **8.38 vs standard RTN int4 9.31** (bf16 7.63) on Qwen2.5-3B.
+- **Remaining (large, follow-up):**
+  - ⏭️ **WGMMA+TMA+ImFP mainloop** for M≥4 prefill — dp4a doesn't amortize past M=1
+    (0.05–0.36× bf16). This is the paper's core tensor-core contribution.
+  - ⏭️ **vLLM serving integration.** Blocker: the container's torch is a 2.9 **nightly** and
+    torchaudio is already ABI-broken against it → prebuilt vLLM wheels won't load. Path: a
+    **dedicated `uv` venv with stable torch + cu12x**, rebuild the extension there, add a
+    `LiquidGemmLinearMethod`, convert an llm-compressor W4A8 checkpoint, serve Llama/Qwen,
+    benchmark throughput/TTFT/TPOT vs vLLM's `int8_w4a8`.
+  - Llama-3.1-8B is **gated** (no HF token on the box) → accuracy used Qwen2.5-3B; set
+    `HF_TOKEN` to use Llama.
 
 Build+test on the box (always GPU 6/7):
 ```
