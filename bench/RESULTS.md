@@ -51,31 +51,35 @@ a `vllm.general_plugins` entry point — **no vLLM fork**. Verified: coherent, c
 generations on **Qwen2.5-3B** and **gemma-4-31B-it** (31B loaded at 19.7 GiB W4 vs ~62 GiB
 bf16). Throughput (tokens/s):
 
-| config | batch 1 | batch 30 | notes |
-|---|---:|---:|---|
-| bf16, **CUDA graphs** (vLLM default) | 319 | 8345 | production baseline |
-| bf16, eager | 88 | 2645 | |
-| **LiquidGEMM (INT8 tensor-core), eager** | 34.8 | 1035 | fused quant→int_mm→scale |
-| LiquidGEMM, CUDA graphs | ✗ | ✗ | crashes: `_int_mm` needs M>16, breaks capture |
+Throughput (tokens/s), CUDA graphs (vLLM default) unless noted:
 
-**Realized wins:** (1) **memory** — INT8 mode ~2× (3.26 vs 5.79 GiB on Qwen2.5-3B), 4-bit
-mode ~3–4× (2.0 GiB; gemma-31B 19.7 vs ~62 GiB) → fit bigger models / more KV / higher
-concurrency; (2) **accuracy** — LiquidQuant W4 beats standard int4 (above).
+| config | batch 1 | batch 30 | mem | notes |
+|---|---:|---:|---:|---|
+| bf16 | 319 | 8345 | 5.79 GiB | fp baseline |
+| **LiquidGEMM — default (CUTLASS INT8)** | **225** | **6386** | 3.23 GiB | 0.71× / 0.77× bf16 |
+| LiquidGEMM — INT8 via torch._int_mm, eager | 34.8 | 1035 | 3.26 GiB | superseded (overhead) |
+| LiquidGEMM — 4-bit custom op (`w4=True`) | works | slow (dp4a) | 2.0 GiB | ~4× mem, decode-only |
 
-**Not yet realized — throughput at concurrency.** LiquidGEMM (eager) is ~2.5× behind
-bf16-eager and ~8× behind bf16-with-CUDA-graphs. Root causes, established empirically:
-1. It isn't a mature fused tensor-core GEMM — `torch._int_mm` (cuBLASLt) carries per-call
-   overhead and its **M>16 restriction breaks CUDA-graph capture**, forcing `enforce_eager`.
-2. Eager mode forgoes the 3.6× CUDA-graph speedup that vLLM's bf16 enjoys.
-3. H20's INT8 tensor cores (~15% of H100) give too little compute headroom to overcome (1).
+**Default path = production-ready.** LiquidQuant weights are stored INT8 and run through
+vLLM's own CUTLASS INT8 GEMM (`cutlass_scaled_mm`) + fused per-token int8 quant
+(`scaled_int8_quant`). It is **CUDA-graph-safe**, fast at all M, and reaches **~0.75× of
+bf16 throughput at ~30 concurrency** while using **~1.8× less weight memory** — and because
+it is the *same* kernel vLLM's W8A8 uses, it is **speed-parity with the INT8 W4A8 baseline,
+with LiquidQuant's better accuracy** (8.38 vs 9.31 ppl above).
 
-**Path to a real throughput win** (the paper's core): a hand-written **fused WGMMA (or
-mma.sync) INT8 W4A8 kernel** — 4-bit weights streamed from GMEM, in-register LiquidQuant
-dequant, INT8 tensor cores, single launch, **CUDA-graph-capturable for all M** (replacing
-`_int_mm`). QServe's `mma.sync.m16n8k32.s8` + `ldmatrix` (in `third_party/omniserve`) is the
-reference. This is QServe/Marlin-level kernel engineering and is the main remaining work.
+Why ~0.75× and not faster: at 3B/short-context decode, per-token latency is dominated by
+attention + non-quantized ops, not the linear GEMMs, so halving weight bytes yields a
+sub-linear gain; the win grows with model size and batch (where weights/KV dominate and the
+memory saving lets you fit more). On H20 the INT8 compute advantage over bf16 is modest.
 
-Current vLLM usage requires `enforce_eager=True`.
+**Remaining upside (task #7): a fused WGMMA/mma.sync W4A8 kernel** — 4-bit weights streamed
+from GMEM + in-register LiquidQuant dequant + INT8 tensor cores, single graph-capturable
+launch — would add the **4× memory** win on top of the CUTLASS-level speed. QServe's
+`mma.sync.m16n8k32.s8` + `ldmatrix` (`third_party/omniserve`) is the reference; it is
+QServe/Marlin-level tuning work.
+
+Modes: default `quantization="liquidgemm"` (INT8/CUTLASS, fast, ~2× mem). Set
+`LIQUIDGEMM_W4=1` for the 4-bit custom-op path (~4× mem, best for pure decode).
 
 ## Reproduce
 ```

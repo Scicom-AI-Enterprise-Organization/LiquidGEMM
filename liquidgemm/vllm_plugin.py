@@ -32,6 +32,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm import _custom_ops as vllm_ops
+
 from .quant import quantize_weight
 from .pack import pack_nibbles
 from . import ops  # noqa: F401  (registers torch.ops.liquidgemm.*)
@@ -45,17 +47,18 @@ def register():
 
 @register_quantization_config("liquidgemm")
 class LiquidGemmConfig(QuantizationConfig):
-    def __init__(self, group_size: int = 64, w4: bool = True):
+    def __init__(self, group_size: int = 64, w4: bool = False):
         super().__init__()
         import os
         self.group_size = group_size
-        # w4=True (default): store 4-bit weights, run the fused custom w4a8_gemm op at all M.
-        #   CUDA-graph-safe (works with vLLM defaults), correct, ~4x weight-memory win.
-        #   dp4a compute is slow for M>16 -> not throughput-competitive yet (see bench/RESULTS).
-        # w4=False: store INT8, run cuBLASLt INT8 tensor cores (torch._int_mm) -> faster in
-        #   eager, ~2x memory, but requires enforce_eager=True (_int_mm breaks graph capture).
+        # Default (w4=False): store LiquidQuant weights as INT8 and run them through vLLM's
+        #   production CUTLASS INT8 GEMM (cutlass_scaled_mm) + fused per-token int8 quant.
+        #   Fast at all M (matches vLLM W8A8), CUDA-graph-safe, ~2x weight-memory, and keeps
+        #   LiquidQuant's accuracy. This is the throughput/production path.
+        # w4=True: store 4-bit and run the custom fused w4a8_gemm op (~4x memory, best for
+        #   pure decode / memory-constrained; dp4a is slow for M>16). Opt-in.
         env = os.environ.get("LIQUIDGEMM_W4")
-        self.w4 = (env != "0") if env is not None else w4
+        self.w4 = (env == "1") if env is not None else w4
 
     @classmethod
     def get_name(cls) -> str:
@@ -125,17 +128,19 @@ class LiquidGemmLinearMethod(LinearMethodBase):
         dev = W.device
         layer.lq_enabled = True
         layer.lq_N, layer.lq_K = qw.N, qw.K
-        layer.register_buffer("lq_s1", qw.s1.to(dev))
         if self.cfg.w4:
             # 4-bit storage (~4x memory win); custom w4a8_gemm op runs at all M.
+            layer.register_buffer("lq_s1", qw.s1.to(dev))              # [N]
             layer.register_buffer("lq_packed", pack_nibbles(qw.qweight_u4).to(dev))
             layer.register_buffer("lq_s_u8", qw.s_u8.to(dev))
             layer.register_buffer("lq_offset_a", qw.offset_a.to(dev))
         else:
-            # INT8 storage (== W4 values, ~2x memory); cuBLASLt INT8 tensor cores.
+            # INT8 storage (== W4 values, ~2x memory) for vLLM's CUTLASS INT8 GEMM. cutlass
+            # wants the B operand column-major [K,N] == a contiguous [N,K] viewed with .t().
             w_i8 = torch.ops.liquidgemm.dequant_weight(
                 qw.qweight_u4.to(dev), qw.s_u8.to(dev), qw.offset_a.to(dev), qw.N, qw.K, g)
-            layer.register_buffer("lq_w_i8_t", w_i8.t().contiguous())  # [K, N]
+            layer.register_buffer("lq_w_i8", w_i8.contiguous())        # [N, K]
+            layer.register_buffer("lq_s1", qw.s1.to(dev).view(qw.N, 1).contiguous())  # scale_b [N,1]
         del layer.weight  # free the bf16 copy
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor,
@@ -145,21 +150,21 @@ class LiquidGemmLinearMethod(LinearMethodBase):
             return y if bias is None else y + bias
         shape = x.shape
         x2 = x.reshape(-1, shape[-1]).contiguous()
-        M, K, N = x2.shape[0], layer.lq_K, layer.lq_N
-        odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
-        x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)   # 1 fused kernel
+        N = layer.lq_N
 
         if self.cfg.w4:
             # 4-bit weights, fused custom op at all M (CUDA-graph-safe, ~4x memory).
+            x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)
             y = torch.ops.liquidgemm.w4a8_gemm(
                 x_i8, layer.lq_packed, layer.lq_s_u8, layer.lq_offset_a, layer.lq_s1,
-                ascale, N, K, self.cfg.group_size).to(x.dtype)
+                ascale, N, layer.lq_K, self.cfg.group_size).to(x.dtype)
         else:
-            # INT8 tensor cores (cuBLASLt) + fused scale epilogue (faster eager; needs
-            # enforce_eager because torch._int_mm's M>16 rule breaks CUDA-graph capture).
-            if M <= 16:
-                x_i8 = torch.cat([x_i8, x_i8.new_zeros(17 - M, K)], 0)
-            acc = torch._int_mm(x_i8, layer.lq_w_i8_t)[:M]        # [M, N] int32
-            y = torch.ops.liquidgemm.scale_epilogue(acc, ascale, layer.lq_s1, odt)  # 1 kernel
+            # Production path: vLLM's fused per-token INT8 quant + CUTLASS INT8 GEMM
+            # (cutlass_scaled_mm). Fast at all M, CUDA-graph-safe, fused scale+bias epilogue.
+            x_q, x_s, _ = vllm_ops.scaled_int8_quant(x2)          # [M,K] int8, [M,1] fp32
+            y = vllm_ops.cutlass_scaled_mm(
+                x_q, layer.lq_w_i8.t(), scale_a=x_s, scale_b=layer.lq_s1,
+                out_dtype=x.dtype, bias=bias)                     # bias fused
+            return y.reshape(*shape[:-1], N)
         y = y.reshape(*shape[:-1], N)
         return y if bias is None else y + bias
