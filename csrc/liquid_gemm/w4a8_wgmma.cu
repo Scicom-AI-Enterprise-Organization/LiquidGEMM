@@ -22,6 +22,14 @@ __device__ __forceinline__ uint32_t wg_expand2(uint32_t h) {
   return (b0 & 0xF) | ((b0 >> 4) << 8) | ((b1 & 0xF) << 16) | ((b1 >> 4) << 24);
 }
 
+// Static 3-way selection (register fragments cannot be runtime-indexed without spilling).
+template <int I, class T>
+__device__ __forceinline__ T& wg_sel3(T& a, T& b, T& c) {
+  if constexpr (I == 0) return a;
+  else if constexpr (I == 1) return b;
+  else return c;
+}
+
 template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class TiledCopyA,
           class TB, class BStride, class BSmemLayout, class TiledCopyB,
@@ -332,12 +340,15 @@ w4a8_wgmma_rs_device(int M, int N, int K,
   Tensor tBsB = thr_copy_b.partition_D(as_position_independent_swizzle_tensor(sB));
 
   ThrMMA thr_mma = mma.get_slice(threadIdx.x);
-  // A register fragments (double-buffered for dequant/WGMMA overlap).
+  // A register fragments, triple-buffered: with warpgroup_wait<1> the previous WGMMA
+  // batch stays in flight across the tile boundary, so the buffer being refilled must
+  // be the one last read two tiles ago (provably retired by the wait<1> chain).
   Tensor dumA = make_tensor(make_smem_ptr((int8_t*)nullptr),
                             make_layout(Shape<Int<RS_BM>, Int<RS_BK>>{},
                                         make_stride(Int<RS_BK>{}, Int<1>{})));
   Tensor tCrA0 = thr_mma.partition_fragment_A(dumA);   // (MMA,MMA_M,MMA_K) int8 rmem
   Tensor tCrA1 = thr_mma.partition_fragment_A(dumA);
+  Tensor tCrA2 = thr_mma.partition_fragment_A(dumA);
   Tensor cA = make_identity_tensor(Shape<Int<RS_BM>, Int<RS_BK>>{});
   Tensor tCcA = thr_mma.partition_A(cA);               // static (m,k) coords per element
 
@@ -408,31 +419,40 @@ w4a8_wgmma_rs_device(int M, int N, int K,
     cp_async_wait<0>();
   }
   __syncthreads();
+  warpgroup_fence_operand(tCrC);
 
-  // Mainloop: WGMMA on (frag cur, sB cur) while CUDA cores stage tile kt+1 —
-  // register-level dequant/MMA overlap (the ImFP idea within one warpgroup).
-  for (int kt = kt0; kt < kt1; ++kt) {
-    const int cur = (kt - kt0) & 1;
-    auto& fragC = (cur == 0) ? tCrA0 : tCrA1;
-    auto& fragN = (cur == 0) ? tCrA1 : tCrA0;
-
+  // Mainloop, unrolled by 3 over static buffer indices: issue WGMMA(kt), then wait<1>
+  // (retires kt-1, leaves kt IN FLIGHT), then load+dequant tile kt+1 into the buffer
+  // last read by the provably-retired kt-2. The tensor pipe never fully drains between
+  // tiles — the deep dequant/MMA overlap the paper's ImFP achieves via warp
+  // specialization, done here with buffer rotation inside one warpgroup.
+  auto step = [&](auto I, int ktc) {
+    constexpr int i = decltype(I)::value;
+    constexpr int in = (i + 1) % 3;
+    if (ktc >= kt1) return;
+    auto& fragC = wg_sel3<i>(tCrA0, tCrA1, tCrA2);
+    auto& fragN = wg_sel3<in>(tCrA0, tCrA1, tCrA2);
     warpgroup_fence_operand(fragC);
-    warpgroup_fence_operand(tCrC);
     warpgroup_arrive();
-    cute::gemm(mma, fragC, tCrB(_, _, _, cur), tCrC);
+    cute::gemm(mma, fragC, tCrB(_, _, _, i), tCrC);
     warpgroup_commit_batch();
-
-    if (kt + 1 < kt1) {  // overlap: load + dequant next tile while WGMMA runs
-      copy(copy_b, tBgB(_, _, _, kt + 1), tBsB(_, _, _, 1 - cur));
+    warpgroup_wait<1>();                              // kt-1 done; ktc stays in flight
+    if (ktc + 1 < kt1) {
+      copy(copy_b, tBgB(_, _, _, ktc + 1), tBsB(_, _, _, in));
       cp_async_fence();
-      fill_frag(fragN, kt + 1);  // dequant doesn't touch the in-flight smem copy...
-      cp_async_wait<0>();        // ...so the cp.async latency hides under its ALU work
+      fill_frag(fragN, ktc + 1);                      // overlaps in-flight WGMMA(ktc)
+      cp_async_wait<0>();
     }
-
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(tCrC);
-    __syncthreads();
+    __syncthreads();                                   // warp-skew guard on buffer reuse
+  };
+  for (int kt = kt0; kt < kt1; kt += 3) {
+    step(Int<0>{}, kt);
+    step(Int<1>{}, kt + 1);
+    step(Int<2>{}, kt + 2);
   }
+  warpgroup_wait<0>();                                 // drain the final batch
+  warpgroup_fence_operand(tCrC);
+  __syncthreads();
 
   // Epilogue: transposed write C[token, channel] with token bounds check.
   CUTE_UNROLL
@@ -468,7 +488,7 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
                         torch::dtype(torch::kInt32).device(x_i8.device()));
 
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{},
-                          make_shape(Int<RS_BN>{}, Int<RS_BK>{}, Int<2>{}));
+                          make_shape(Int<RS_BN>{}, Int<RS_BK>{}, Int<3>{}));  // 3-deep
   TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>{},
                                     Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                     Layout<Shape<_1, _16>>{});

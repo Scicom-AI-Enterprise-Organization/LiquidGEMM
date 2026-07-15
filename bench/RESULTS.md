@@ -209,14 +209,30 @@ Also tried and **rejected**: fragment-order scale prepack (one coalesced 8B load
 unpack per register = AND / SHR+AND + IMAD + XOR — the true "2 arithmetic instructions
 per 4 elements"): gate_up M=64 121→103us; serving 96.6→**105.0** b1, 2669→**2861** b30.
 
-**Roofline honesty (the "shouldn't W4 be ~4× faster than bf16?" question — yes, it
-should):** at M=64 the W4 memory floor is ~¼ of bf16's (gate_up: ~18us vs ~71us), but the
-kernel sits at ~0.8–0.9× bf16, i.e. ~4–5× off its own ceiling. With dequant math now
-minimal, the measured gap is **pipeline depth**: one 128-thread warpgroup per CTA, a full
-WGMMA drain (`wait<0>` + `__syncthreads`) every K-tile, and single-batch WGMMA occupancy.
-Closing it = the deep restructure: 3-stage smem/fragment buffers + `wait<1>` (two WGMMA
-batches in flight, no per-tile drain), then 2-warpgroup CTAs — i.e. the full ImFP/ExCP
-engineering the paper spent its H800 effort on. That is the next focused session.
+**Deep pipeline landed (`wait<1>` + 3-buffer rotation):** the per-tile WGMMA drain was the
+bottleneck, exactly as the roofline predicted. The mainloop now keeps the previous WGMMA
+batch in flight across tile boundaries (statically-unrolled ×3 buffer rotation; the buffer
+being refilled is always the one read two tiles ago, provably retired by the `wait<1>`
+chain). **~2× across the board, all bit-exact.** Decode tile (M=64) vs cuBLAS bf16, H100:
+
+| shape | before | after | vs bf16 |
+|---|---:|---:|---:|
+| qkv 6144←4096 | 28.6us | **19.8us** | **1.09×** |
+| gate_up 28672←4096 | 103.2us | **60.4us** | **1.40×** |
+| down 4096←14336 | 54.8us | **34.9us** | **1.34×** |
+| o 4096←4096 | 21.5us | 17.5us | 0.61× (small-shape occupancy) |
+| **aggregate** | 208us | **132.6us** | **1.23× faster than bf16** |
+
+**W4 is now faster than bf16 at decode tiles** — the "lesser bandwidth ⇒ faster" promise
+made real (3 of 4 shapes; ceiling remains ~4×, next levers: `o`-shape occupancy, n128
+tiles / 2-warpgroup CTAs for prefill M≥256 which sits at 0.5–0.7×).
+
+**End-to-end w4 serving (Llama-3.1-8B, H100, CUDA graphs, 5.83 GiB true 4-bit):**
+80.5 → 96.6 → 105 → **137.1 tok/s** (b1); 2279 → 2669 → 2861 → **3679 tok/s** (b30)
+across the optimization arc (split-K → mask-shift → deep pipeline). Now 0.87× of bf16
+end-to-end at 2.6× less weight memory, 0.63× of fp8 at 1.5× less. On H20 (bandwidth-rich,
+compute-poor — production), these kernel gains should translate to an outright win;
+re-bench when the box frees.
 
 In-tree W4A8 baseline: no official RedHatAI W4A8 Llama-3.1-8B checkpoint exists on HF
 (only third-party GPTQ variants); a rigorous llm-compressor W4A8 calibration run is the
