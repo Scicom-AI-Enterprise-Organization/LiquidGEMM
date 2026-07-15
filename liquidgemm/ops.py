@@ -49,7 +49,7 @@ def _w4a8_wgmma_fake(x_i8, packed, s_u8, off_a, N, K, group_size):
 
 
 @torch.library.register_fake("liquidgemm::w4a8_wgmma_rs")
-def _w4a8_wgmma_rs_fake(x_i8, w, s_u8, off_a, N, K, group_size, packed):
+def _w4a8_wgmma_rs_fake(x_i8, w, spack, s_u8, off_a, N, K, group_size, packed):
     return x_i8.new_empty((x_i8.shape[0], N), dtype=torch.int32)
 
 
@@ -122,6 +122,38 @@ def repack_rs_weight(qw: LiquidQuantWeight) -> torch.Tensor:
     return packed.contiguous()                                   # [RB, KT, 128, 32]
 
 
+def build_rs_scale_pack(qw: LiquidQuantWeight) -> torch.Tensor:
+    """Prepack per-group (s_u8, offset_a) in RS fragment order: uint8 [N/64, K/128, 128, 8].
+
+    Each thread's 8 bytes per K-tile hold the 4 (scale, offset) pairs it can need —
+    (row m0/m1) x (group g0/g1) — laid out [g][r] pairs (s, a). One coalesced 8-byte
+    load replaces 8 scattered byte loads per tile.
+    """
+    coords = torch.ops.liquidgemm.wgmma_rs_a_coords().cpu()  # [128, 64, 2]
+    T, E, _ = coords.shape
+    m = coords[..., 0].long()
+    m_reg = m.view(T, E // 4, 4)[:, :, 0]        # row per register [128, 16]
+    m0 = m[:, 0]                                  # elem-0 row per thread [128]
+    # each thread touches exactly 2 distinct rows (asserted in repack_rs_weight)
+    is_m1 = m_reg != m0[:, None]                  # [128, 16]
+    m1 = torch.where(is_m1.any(1), m_reg[torch.arange(T), is_m1.float().argmax(1)], m0)
+
+    N, K = qw.N, qw.K
+    RB, KT = N // 64, K // 128
+    G = K // qw.group_size
+    assert G == KT * 2, "group_size 64 with BK=128 -> 2 groups per K-tile"
+    dev = qw.s_u8.device
+    rows2 = torch.stack([m0, m1], 1).to(dev)      # [128, 2(r)]
+    sv = qw.s_u8.view(RB, 64, KT, 2)              # [RB, row, KT, g]
+    av = qw.offset_a.view(RB, 64, KT, 2)
+    s_sel = sv[:, rows2]                          # [RB, 128, 2(r), KT, 2(g)]
+    a_sel = av[:, rows2]
+    # -> [RB, KT, 128, g, r, (s,a)] -> flatten to 8 bytes in [g][r] pair order
+    pk = torch.stack([s_sel, a_sel], -1)          # [RB,128,r,KT,g,2]
+    pk = pk.permute(0, 3, 1, 4, 2, 5).contiguous()  # [RB,KT,128,g,r,2]
+    return pk.view(RB, KT, 128, 8).to(torch.uint8)
+
+
 def w4a8_gemm_rs(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight,
                  rs_packed: torch.Tensor = None,
                  out_dtype: torch.dtype = torch.float16):
@@ -129,10 +161,12 @@ def w4a8_gemm_rs(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight
     K, N = qw.K, qw.N
     if rs_packed is None:
         w, packed = pack_nibbles(qw.qweight_u4).cuda().contiguous(), False
+        spack = qw.s_u8.cuda()  # unused in the gather path
     else:
         w, packed = rs_packed.cuda(), True
+        spack = build_rs_scale_pack(qw).cuda()
     acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
-        x_i8.cuda().contiguous(), w, qw.s_u8.cuda(), qw.offset_a.cuda(),
+        x_i8.cuda().contiguous(), w, spack, qw.s_u8.cuda(), qw.offset_a.cuda(),
         N, K, qw.group_size, packed)
     y = torch.ops.liquidgemm.scale_epilogue(
         acc, ascale.cuda().contiguous(), qw.s1.cuda(),

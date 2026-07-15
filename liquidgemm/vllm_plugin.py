@@ -135,6 +135,7 @@ class LiquidGemmLinearMethod(LinearMethodBase):
             # In-register dequant feeds INT8 WGMMA directly (the LiquidGEMM datapath).
             layer.register_buffer("lq_s1", qw.s1.to(dev))              # [N]
             layer.register_buffer("lq_rs", ops.repack_rs_weight(qw).to(dev))
+            layer.register_buffer("lq_spack", ops.build_rs_scale_pack(qw).to(dev))
             layer.register_buffer("lq_s_u8", qw.s_u8.to(dev))
             layer.register_buffer("lq_offset_a", qw.offset_a.to(dev))
         else:
@@ -160,7 +161,7 @@ class LiquidGemmLinearMethod(LinearMethodBase):
             # The op pads tokens to its 64-token CTA tile internally (compile/graph-safe).
             x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)
             acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
-                x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_offset_a,
+                x_i8, layer.lq_rs, layer.lq_spack, layer.lq_s_u8, layer.lq_offset_a,
                 N, layer.lq_K, self.cfg.group_size, True)
             odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
             y = torch.ops.liquidgemm.scale_epilogue(acc, ascale, layer.lq_s1, odt)

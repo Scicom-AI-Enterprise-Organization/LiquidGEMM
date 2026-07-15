@@ -303,6 +303,7 @@ w4a8_wgmma_rs_device(int M, int N, int K,
                      int8_t const* __restrict__ X,     // [M,K] tokens (B operand)
                      uint8_t const* __restrict__ Wp,   // PACKED? fragment-order pack
                                                        //        : [N,K/2] nibble-packed
+                     uint8_t const* __restrict__ Spack,// PACKED: [N/64,K/128,128,8] scales
                      uint8_t const* __restrict__ s_u8, // [N,G]
                      uint8_t const* __restrict__ off_a,// [N,G]
                      int32_t* __restrict__ C,          // [M,N] int32 accum out
@@ -312,6 +313,11 @@ w4a8_wgmma_rs_device(int M, int N, int K,
   const int t0 = blockIdx.y * RS_BN;   // token offset
   const int Kh = K >> 1;
   const int KT = K / RS_BK;
+  // Split-K: blockIdx.z handles K-tiles [kt0, kt1); partial sums go to slice z of C.
+  const int chunk = (KT + gridDim.z - 1) / gridDim.z;
+  const int kt0 = blockIdx.z * chunk;
+  const int kt1 = (kt0 + chunk < KT) ? kt0 + chunk : KT;
+  C += (long)blockIdx.z * M * N;
 
   extern __shared__ char smem_raw[];
   Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<int8_t*>(smem_raw)),
@@ -350,10 +356,24 @@ w4a8_wgmma_rs_device(int M, int N, int K,
   auto fill_frag = [&](auto& frag, int kt) {
     const int k0 = kt * RS_BK;
     if constexpr (PACKED) {
-      // Fragment-order pack: this thread's 64 nibbles at 32-byte offset, coalesced.
+      // Fragment-order pack: this thread's 64 nibbles at 32-byte offset, coalesced;
+      // scales via ONE 8-byte fragment-order load (4 (s,a) pairs: (row m0/m1)x(group g0/g1))
+      // with a statically-folded per-register selection — no scattered loads at all.
       const uint4* p = reinterpret_cast<const uint4*>(
           Wp + ((size_t)(blockIdx.x * KT + kt) * 128 + threadIdx.x) * (FRAG / 2));
+      const uint2 spv = *reinterpret_cast<const uint2*>(
+          Spack + ((size_t)(blockIdx.x * KT + kt) * 128 + threadIdx.x) * 8);
       uint32_t* fr = reinterpret_cast<uint32_t*>(raw_pointer_cast(frag.data()));
+      auto sa_of = [&](int j, uint32_t& s, uint32_t& aw) {  // static per unrolled j
+        const int e = j * 4;
+        const int rsel = (get<0>(tCcA(e)) != get<0>(tCcA(0))) ? 1 : 0;
+        const int gsel = (int)(get<1>(tCcA(e)) >> 6);       // group within BK=128 tile
+        const int idx = gsel * 2 + rsel;
+        const uint32_t word = (idx < 2) ? spv.x : spv.y;
+        const uint32_t sh = (idx & 1) * 16;
+        s = (word >> sh) & 0xFF;
+        aw = ((word >> (sh + 8)) & 0xFF) * 0x01010101u;
+      };
       CUTE_UNROLL
       for (int v = 0; v < FRAG / 32; ++v) {            // one uint4 = 32 nibbles = 8 regs
         const uint4 pk = p[v];
@@ -361,14 +381,9 @@ w4a8_wgmma_rs_device(int M, int N, int K,
         CUTE_UNROLL
         for (int h = 0; h < 4; ++h) {                  // each uint32 = 8 nibbles = 2 regs
           const int j = v * 8 + h * 2;                 // register pair index
-          // group scale/offset: reg pair spans elems 8j0..; row/col from static coords
-          const int e = j * 4;
-          const int m0 = get<0>(tCcA(e)), k0a = get<1>(tCcA(e));
-          const int m1 = get<0>(tCcA(e + 4)), k1a = get<1>(tCcA(e + 4));
-          const uint32_t s0 = __ldg(&s_u8[(n0 + m0) * G + ((k0 + k0a) >> 6)]);
-          const uint32_t a0 = __ldg(&off_a[(n0 + m0) * G + ((k0 + k0a) >> 6)]) * 0x01010101u;
-          const uint32_t s1v = __ldg(&s_u8[(n0 + m1) * G + ((k0 + k1a) >> 6)]);
-          const uint32_t a1 = __ldg(&off_a[(n0 + m1) * G + ((k0 + k1a) >> 6)]) * 0x01010101u;
+          uint32_t s0, a0, s1v, a1;
+          sa_of(j, s0, a0);
+          sa_of(j + 1, s1v, a1);
           fr[j]     = (wg_expand2(w[h] & 0xFFFF) * s0 + a0) ^ 0x80808080u;
           fr[j + 1] = (wg_expand2(w[h] >> 16) * s1v + a1) ^ 0x80808080u;
         }
@@ -388,17 +403,20 @@ w4a8_wgmma_rs_device(int M, int N, int K,
     }
   };
 
-  // Prologue: stage B tile 0 and dequant A fragment 0.
-  copy(copy_b, tBgB(_, _, _, 0), tBsB(_, _, _, 0));
-  cp_async_fence();
-  fill_frag(tCrA0, 0);
-  cp_async_wait<0>();
+  // Prologue: stage B tile kt0 and dequant A fragment kt0. (kt0 >= kt1 -> zero output,
+  // still written so the split-K reduction stays correct.)
+  if (kt0 < kt1) {
+    copy(copy_b, tBgB(_, _, _, kt0), tBsB(_, _, _, 0));
+    cp_async_fence();
+    fill_frag(tCrA0, kt0);
+    cp_async_wait<0>();
+  }
   __syncthreads();
 
   // Mainloop: WGMMA on (frag cur, sB cur) while CUDA cores stage tile kt+1 —
   // register-level dequant/MMA overlap (the ImFP idea within one warpgroup).
-  for (int kt = 0; kt < KT; ++kt) {
-    const int cur = kt & 1;
+  for (int kt = kt0; kt < kt1; ++kt) {
+    const int cur = (kt - kt0) & 1;
     auto& fragC = (cur == 0) ? tCrA0 : tCrA1;
     auto& fragN = (cur == 0) ? tCrA1 : tCrA0;
 
@@ -408,7 +426,7 @@ w4a8_wgmma_rs_device(int M, int N, int K,
     cute::gemm(mma, fragC, tCrB(_, _, _, cur), tCrC);
     warpgroup_commit_batch();
 
-    if (kt + 1 < KT) {   // overlap: load + dequant next tile while WGMMA runs
+    if (kt + 1 < kt1) {  // overlap: load + dequant next tile while WGMMA runs
       copy(copy_b, tBgB(_, _, _, kt + 1), tBsB(_, _, _, 1 - cur));
       cp_async_fence();
       fill_frag(fragN, kt + 1);
@@ -429,11 +447,12 @@ w4a8_wgmma_rs_device(int M, int N, int K,
   }
 }
 
-torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s_u8,
-                            torch::Tensor off_a, int64_t N, int64_t K,
+torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor spack,
+                            torch::Tensor s_u8, torch::Tensor off_a, int64_t N, int64_t K,
                             int64_t group_size, bool packed) {
   TORCH_CHECK(x_i8.is_cuda() && x_i8.dtype() == torch::kInt8);
   TORCH_CHECK(w.dtype() == torch::kUInt8 && group_size == 64);
+  spack = spack.contiguous();
   TORCH_CHECK(N % RS_BM == 0 && K % RS_BK == 0, "N%64==0 and K%128==0 required");
   w = w.contiguous();
   const int M = x_i8.size(0);
@@ -443,7 +462,14 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
   x_i8 = (Mp == M) ? x_i8.contiguous()
                    : torch::constant_pad_nd(x_i8, {0, 0, 0, Mp - M}, 0).contiguous();
   const int G = K / group_size;
-  auto c = torch::empty({Mp, (int)N}, torch::dtype(torch::kInt32).device(x_i8.device()));
+  // Split-K for the decode regime: small M leaves few CTAs while long K serializes the
+  // mainloop (e.g. down-proj K=14336 = 112 K-tiles). Partial int32 sums are exact.
+  const int KT_total = K / RS_BK;
+  int S = 1;
+  if (Mp <= 128 && KT_total >= 64) S = 4;
+  else if (Mp <= 128 && KT_total >= 32) S = 2;
+  auto c = torch::empty({(long)S * Mp, (long)N},
+                        torch::dtype(torch::kInt32).device(x_i8.device()));
 
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{},
                           make_shape(Int<RS_BN>{}, Int<RS_BK>{}, Int<2>{}));
@@ -453,7 +479,7 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
   TiledMMA mma = make_tiled_mma(RsMmaAtom{});
 
   const int smem_bytes = cosize_v<decltype(sB)> * (int)sizeof(int8_t);
-  dim3 grid((int)N / RS_BM, Mp / RS_BN);
+  dim3 grid((int)N / RS_BM, Mp / RS_BN, S);
   dim3 block(128);
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -462,18 +488,21 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     kernel<<<grid, block, smem_bytes, stream>>>(
         Mp, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
-        s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(), c.data_ptr<int32_t>(), G,
-        sB, copyB, mma);
+        spack.data_ptr<uint8_t>(), s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(),
+        c.data_ptr<int32_t>(), G, sB, copyB, mma);
   } else {
     auto kernel = &w4a8_wgmma_rs_device<false, decltype(sB), decltype(copyB), decltype(mma)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     kernel<<<grid, block, smem_bytes, stream>>>(
         Mp, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
-        s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(), c.data_ptr<int32_t>(), G,
-        sB, copyB, mma);
+        s_u8.data_ptr<uint8_t>(), s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(),
+        c.data_ptr<int32_t>(), G, sB, copyB, mma);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return (Mp == M) ? c : c.narrow(0, 0, M);
+  torch::Tensor acc = (S == 1)
+      ? c
+      : c.view({S, (long)Mp, (long)N}).sum(0, /*keepdim=*/false, torch::kInt32);
+  return (Mp == M) ? acc : acc.narrow(0, 0, M);
 }
 
 // Stage 1: C[M,N] int32 = A[M,K] int8 @ B[N,K] int8^T  (TN, row-major inputs).

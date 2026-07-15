@@ -22,8 +22,8 @@ torch::Tensor w4a8_wgmma(torch::Tensor x_i8, torch::Tensor packed, torch::Tensor
 
 torch::Tensor wgmma_rs_a_coords();
 
-torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s_u8,
-                            torch::Tensor off_a, int64_t N, int64_t K,
+torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor spack,
+                            torch::Tensor s_u8, torch::Tensor off_a, int64_t N, int64_t K,
                             int64_t group_size, bool packed);
 
 torch::Tensor scale_epilogue(torch::Tensor acc, torch::Tensor ascale, torch::Tensor s1,
@@ -44,7 +44,7 @@ TORCH_LIBRARY(liquidgemm, m) {
   m.def("w4a8_wgmma(Tensor x_i8, Tensor packed, Tensor s_u8, Tensor off_a, int N, int K, int group_size) -> Tensor");
   // no Tensor args -> register with an inline catch-all kernel (cannot dispatch by device)
   m.def("wgmma_rs_a_coords", &liquidgemm::wgmma_rs_a_coords);
-  m.def("w4a8_wgmma_rs(Tensor x_i8, Tensor w, Tensor s_u8, Tensor off_a, int N, int K, int group_size, bool packed) -> Tensor");
+  m.def("w4a8_wgmma_rs(Tensor x_i8, Tensor w, Tensor spack, Tensor s_u8, Tensor off_a, int N, int K, int group_size, bool packed) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(liquidgemm, CUDA, m) {
