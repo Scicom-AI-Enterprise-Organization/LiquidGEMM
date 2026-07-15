@@ -161,10 +161,9 @@ def w4a8_gemm_rs(x_i8: torch.Tensor, ascale: torch.Tensor, qw: LiquidQuantWeight
     K, N = qw.K, qw.N
     if rs_packed is None:
         w, packed = pack_nibbles(qw.qweight_u4).cuda().contiguous(), False
-        spack = qw.s_u8.cuda()  # unused in the gather path
     else:
         w, packed = rs_packed.cuda(), True
-        spack = build_rs_scale_pack(qw).cuda()
+    spack = qw.s_u8.cuda()  # scale-pack rejected (perf-neutral, +25% memory); dummy arg
     acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
         x_i8.cuda().contiguous(), w, spack, qw.s_u8.cuda(), qw.offset_a.cuda(),
         N, K, qw.group_size, packed)

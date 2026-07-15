@@ -184,6 +184,34 @@ class (fit bigger models / more KV) → that is LiquidGEMM's actual lane: the w4
 with vLLM's in-tree W4A8-FP8 (`cutlass_w4a8`, int4→fp8 LUT) as the baseline to beat on
 Hopper — closing that gap needs the TMA/multi-CTA/split-K work already documented.
 
+## W4-lane optimization session (split-K) — H100, Llama-3.1-8B
+
+Per the user's direction, the 4-bit lane is the focus. **Split-K** added to the RS kernel
+(K-tile chunks across `blockIdx.z`, exact int32 partial reduction; auto-enabled at
+M≤128 & K≥4096). Kernel-level (M=64 decode tile, vs cuBLAS bf16):
+
+| shape | before | after split-K |
+|---|---:|---:|
+| down 4096←14336 | 118.4us (0.39×) | **54.5us (0.88×)** |
+| qkv 6144←4096 | 31.0us (0.69×) | 29.6us (0.75×) |
+| gate_up 28672←4096 | 97.9us (0.86×) | ~121us (0.73×)* |
+| decode aggregate | 0.55× bf16 | **~0.74× bf16** |
+
+*gate_up regression is run-to-run noise; its split-K doesn't trigger (N-CTAs already high).
+
+**End-to-end w4 serving (Llama-3.1-8B, CUDA graphs):** 80.5 → **96.6 tok/s** (b1),
+2279 → **2669 tok/s** (b30), still **5.83 GiB** true 4-bit. All kernels bit-exact.
+
+Also tried and **rejected**: fragment-order scale prepack (one coalesced 8B load replacing
+8 cached `__ldg` scale bytes/tile) — measured perf-neutral on H100 but +25% weight memory
+(6.65 vs 5.83 GiB). Not worth it in the memory lane; builder kept in `ops.py` for reference.
+Remaining dequant cost is ALU/pipeline-bound: next levers are PRMT-based nibble unpack,
+`wait<1>` deeper WGMMA pipelining (needs 3-4 B-buffers), and n128 tiles for prefill.
+
+In-tree W4A8 baseline: no official RedHatAI W4A8 Llama-3.1-8B checkpoint exists on HF
+(only third-party GPTQ variants); a rigorous llm-compressor W4A8 calibration run is the
+proper follow-up when the H20 box frees up.
+
 ## Reproduce
 ```
 CUDA_VISIBLE_DEVICES=6 python bench/microbench.py

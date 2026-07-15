@@ -356,24 +356,13 @@ w4a8_wgmma_rs_device(int M, int N, int K,
   auto fill_frag = [&](auto& frag, int kt) {
     const int k0 = kt * RS_BK;
     if constexpr (PACKED) {
-      // Fragment-order pack: this thread's 64 nibbles at 32-byte offset, coalesced;
-      // scales via ONE 8-byte fragment-order load (4 (s,a) pairs: (row m0/m1)x(group g0/g1))
-      // with a statically-folded per-register selection — no scattered loads at all.
+      // Fragment-order pack: this thread's 64 nibbles at 32-byte offset, coalesced.
+      // Scales via cached __ldg byte loads (a fragment-order scale pack was measured
+      // perf-NEUTRAL on H100 but costs +25% weight memory — rejected; see RESULTS.md).
       const uint4* p = reinterpret_cast<const uint4*>(
           Wp + ((size_t)(blockIdx.x * KT + kt) * 128 + threadIdx.x) * (FRAG / 2));
-      const uint2 spv = *reinterpret_cast<const uint2*>(
-          Spack + ((size_t)(blockIdx.x * KT + kt) * 128 + threadIdx.x) * 8);
       uint32_t* fr = reinterpret_cast<uint32_t*>(raw_pointer_cast(frag.data()));
-      auto sa_of = [&](int j, uint32_t& s, uint32_t& aw) {  // static per unrolled j
-        const int e = j * 4;
-        const int rsel = (get<0>(tCcA(e)) != get<0>(tCcA(0))) ? 1 : 0;
-        const int gsel = (int)(get<1>(tCcA(e)) >> 6);       // group within BK=128 tile
-        const int idx = gsel * 2 + rsel;
-        const uint32_t word = (idx < 2) ? spv.x : spv.y;
-        const uint32_t sh = (idx & 1) * 16;
-        s = (word >> sh) & 0xFF;
-        aw = ((word >> (sh + 8)) & 0xFF) * 0x01010101u;
-      };
+      (void)Spack;
       CUTE_UNROLL
       for (int v = 0; v < FRAG / 32; ++v) {            // one uint4 = 32 nibbles = 8 regs
         const uint4 pk = p[v];
@@ -381,9 +370,13 @@ w4a8_wgmma_rs_device(int M, int N, int K,
         CUTE_UNROLL
         for (int h = 0; h < 4; ++h) {                  // each uint32 = 8 nibbles = 2 regs
           const int j = v * 8 + h * 2;                 // register pair index
-          uint32_t s0, a0, s1v, a1;
-          sa_of(j, s0, a0);
-          sa_of(j + 1, s1v, a1);
+          const int e = j * 4;
+          const int m0 = get<0>(tCcA(e)), k0a = get<1>(tCcA(e));
+          const int m1 = get<0>(tCcA(e + 4)), k1a = get<1>(tCcA(e + 4));
+          const uint32_t s0 = __ldg(&s_u8[(n0 + m0) * G + ((k0 + k0a) >> 6)]);
+          const uint32_t a0 = __ldg(&off_a[(n0 + m0) * G + ((k0 + k0a) >> 6)]) * 0x01010101u;
+          const uint32_t s1v = __ldg(&s_u8[(n0 + m1) * G + ((k0 + k1a) >> 6)]);
+          const uint32_t a1 = __ldg(&off_a[(n0 + m1) * G + ((k0 + k1a) >> 6)]) * 0x01010101u;
           fr[j]     = (wg_expand2(w[h] & 0xFFFF) * s0 + a0) ^ 0x80808080u;
           fr[j + 1] = (wg_expand2(w[h] >> 16) * s1v + a1) ^ 0x80808080u;
         }
