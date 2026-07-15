@@ -118,8 +118,14 @@ def repack_rs_weight(qw: LiquidQuantWeight) -> torch.Tensor:
     q = qw.qweight_u4.view(RB, 64, KT, 128).permute(0, 2, 1, 3)  # [RB, KT, 64rows, 128k]
     m, k = m.to(q.device), k.to(q.device)
     out = q[:, :, m, k]                                          # [RB, KT, 128thr, 64elem]
-    packed = (out[..., 0::2] | (out[..., 1::2] << 4)).to(torch.uint8)
-    return packed.contiguous()                                   # [RB, KT, 128, 32]
+    # Interleave for mask-shift unpack (the paper's reorder trick): byte b of 32-bit word h
+    # holds elem[8h+b] in the LOW nibble and elem[8h+4+b] in the HIGH nibble, so the kernel
+    # unpacks a whole register with one AND (and its pair with SHR+AND) — no lane shuffling.
+    ev = out.view(*out.shape[:-1], E // 8, 2, 4)                 # [..., word, regpair, lane]
+    lo = ev[..., 0, :]                                           # reg 2h lanes
+    hi = ev[..., 1, :]                                           # reg 2h+1 lanes
+    packed = (lo | (hi << 4)).to(torch.uint8)                    # [..., word, 4 bytes]
+    return packed.reshape(RB, KT, 128, E // 2).contiguous()      # [RB, KT, 128, 32]
 
 
 def build_rs_scale_pack(qw: LiquidQuantWeight) -> torch.Tensor:

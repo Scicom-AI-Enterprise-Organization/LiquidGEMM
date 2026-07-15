@@ -356,9 +356,12 @@ w4a8_wgmma_rs_device(int M, int N, int K,
   auto fill_frag = [&](auto& frag, int kt) {
     const int k0 = kt * RS_BK;
     if constexpr (PACKED) {
-      // Fragment-order pack: this thread's 64 nibbles at 32-byte offset, coalesced.
-      // Scales via cached __ldg byte loads (a fragment-order scale pack was measured
-      // perf-NEUTRAL on H100 but costs +25% weight memory — rejected; see RESULTS.md).
+      // Fragment-order pack with mask-shift interleave (the paper's reorder trick):
+      // word h = low nibbles of reg 2h in its 4 byte lanes, high nibbles of reg 2h+1.
+      // Unpack + dequant per register = AND (or SHR+AND) + IMAD + XOR — the paper's
+      // "2 arithmetic instructions per 4 elements" datapath, no lane shuffling.
+      // Scales via cached __ldg byte loads (a scale prepack was measured perf-neutral
+      // on H100 but costs +25% weight memory — rejected; see RESULTS.md).
       const uint4* p = reinterpret_cast<const uint4*>(
           Wp + ((size_t)(blockIdx.x * KT + kt) * 128 + threadIdx.x) * (FRAG / 2));
       uint32_t* fr = reinterpret_cast<uint32_t*>(raw_pointer_cast(frag.data()));
@@ -377,8 +380,8 @@ w4a8_wgmma_rs_device(int M, int N, int K,
           const uint32_t a0 = __ldg(&off_a[(n0 + m0) * G + ((k0 + k0a) >> 6)]) * 0x01010101u;
           const uint32_t s1v = __ldg(&s_u8[(n0 + m1) * G + ((k0 + k1a) >> 6)]);
           const uint32_t a1 = __ldg(&off_a[(n0 + m1) * G + ((k0 + k1a) >> 6)]) * 0x01010101u;
-          fr[j]     = (wg_expand2(w[h] & 0xFFFF) * s0 + a0) ^ 0x80808080u;
-          fr[j + 1] = (wg_expand2(w[h] >> 16) * s1v + a1) ^ 0x80808080u;
+          fr[j]     = ((w[h] & 0x0F0F0F0Fu) * s0 + a0) ^ 0x80808080u;
+          fr[j + 1] = (((w[h] >> 4) & 0x0F0F0F0Fu) * s1v + a1) ^ 0x80808080u;
         }
       }
     } else {
@@ -422,8 +425,8 @@ w4a8_wgmma_rs_device(int M, int N, int K,
     if (kt + 1 < kt1) {  // overlap: load + dequant next tile while WGMMA runs
       copy(copy_b, tBgB(_, _, _, kt + 1), tBsB(_, _, _, 1 - cur));
       cp_async_fence();
-      fill_frag(fragN, kt + 1);
-      cp_async_wait<0>();
+      fill_frag(fragN, kt + 1);  // dequant doesn't touch the in-flight smem copy...
+      cp_async_wait<0>();        // ...so the cp.async latency hides under its ALU work
     }
 
     warpgroup_wait<0>();
