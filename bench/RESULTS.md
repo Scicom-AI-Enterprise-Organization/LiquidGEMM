@@ -135,8 +135,8 @@ meta-llama repo gated). Serving = CUDA graphs, out=128.
 | **LiquidGEMM int8 (CUTLASS)** | **228.7 (1.45×)** | **6053 (1.40×)** | 8.99 GiB |
 | **LiquidGEMM w4 (RS-WGMMA)** | 80.5 (0.51×) | 2279 (0.53×) | **5.83 GiB** |
 
-- **int8 mode: 1.40–1.45× faster than bf16 on H100** — the production win replicates
-  across GPUs (H20/gemma-31B was 1.74×). This is the recommended serving mode.
+- **int8 mode: 1.40–1.45× faster than bf16 on H100** — replicates across GPUs
+  (H20/gemma-31B was 1.74×). **Superseded as the recommendation — see fp8 below.**
 - **w4 mode (the paper's RS-WGMMA kernel) serves end-to-end under CUDA graphs** with true
   4-bit weights (2.6× less than bf16) at ~0.5× bf16 speed on H100. On H20 the same kernel
   is ~1.0–1.1× bf16 at M≥128 — H100's ~7× faster tensor cores raise the bar, and closing
@@ -160,6 +160,29 @@ g128) — unlike Qwen2.5-3B where LiquidQuant was decisively better (8.38 vs 9.3
 LQQ advantage is model-dependent: it pays off on weight distributions with outliers
 (Qwen), while its protective range costs a little resolution on well-behaved ones (Llama).
 Both models: W4A8 ≈ W4 + small activation penalty, i.e. int8 activations are cheap.
+
+## FP8 dynamic vs the int8 mode (user question: "why int8 if Hopper has fp8?")
+
+Measured — same H100 SXM class, Llama-3.1-8B, CUDA graphs, out=128 (bf16 anchor within
+4% across pods, so directly comparable):
+
+| mode | batch 1 | batch 30 | weights | weight fidelity |
+|---|---:|---:|---:|---|
+| bf16 | 154–158 | 4159–4320 | 15.0 GiB | exact |
+| **vLLM `fp8` dynamic** | **237.4 (1.54×)** | **5851 (1.41×)** | **8.54 GiB** | fp8 of *original* weights |
+| LiquidGEMM int8 | 228.7 (1.45×) | 6053 (1.40×) | 8.99 GiB | **W4-reconstructed** |
+| LiquidGEMM w4 (RS) | 80.5 | 2279 | 5.83 GiB | W4 |
+
+**Verdict — the user is right: on Hopper there is no reason to use the int8 mode.**
+FP8 == INT8 tensor-core rate on Hopper, so speed is a wash (fp8 wins b1, int8 wins b30 by
+~3%, noise), fp8 uses slightly *less* memory, needs zero custom code, and is strictly more
+accurate at that memory (8-bit encode of the original weights vs our W4-reconstructed
+weights). The int8 mode's only remaining niche is **non-FP8 GPUs (A100/Ampere)**.
+
+**Revised recommendation:** 8-bit class → vLLM `quantization="fp8"` (dynamic). 4-bit
+class (fit bigger models / more KV) → that is LiquidGEMM's actual lane: the w4/RS kernel,
+with vLLM's in-tree W4A8-FP8 (`cutlass_w4a8`, int4→fp8 LUT) as the baseline to beat on
+Hopper — closing that gap needs the TMA/multi-CTA/split-K work already documented.
 
 ## Reproduce
 ```

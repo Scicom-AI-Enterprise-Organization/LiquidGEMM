@@ -111,10 +111,15 @@ claude-ping.json    # remote-box connection config
 
 The paper's kernel (RS-WGMMA, in-register IMAD+XOR dequant, fragment-order 4-bit pack,
 dequant/MMA overlap) is implemented, bit-exact, and serving in vLLM under CUDA graphs.
-Production recommendation: **int8 mode** (default) — 1.4–1.75× bf16 throughput at ~1.7×
-less memory, validated on H20 (gemma-31B) and H100 (Llama-3.1-8B). w4 mode = max memory
-savings (true 4-bit). Remaining perf work for w4 on big-compute parts (H100/H800):
-TMA + multi-CTA warp specialization + split-K.
+
+**Production guidance (user decision, 2026-07-15): on Hopper prefer vLLM's native
+`quantization="fp8"` (dynamic) over our int8 mode for the 8-bit class.** Rationale:
+FP8 == INT8 tensor-core rate on Hopper; vLLM fp8 kernels are first-class; and fp8-W8
+encodes the *original* bf16 weights (~W8 fidelity) while our int8 mode stores
+W4-reconstructed weights — W4 error at W8 memory. int8 mode = fallback for non-FP8
+GPUs (A100) only. **LiquidGEMM's real value on Hopper = the 4-bit class** (w4/RS mode;
+in-tree competitor: vLLM's W4A8-FP8 `cutlass_w4a8`). Remaining w4 perf work on
+big-compute parts (H100/H800): TMA + multi-CTA warp specialization + split-K.
 
 Full plan: `/Users/husein.z/.claude/plans/functional-orbiting-kite.md`.
 
