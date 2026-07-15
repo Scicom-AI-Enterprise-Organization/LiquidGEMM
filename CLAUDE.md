@@ -107,19 +107,26 @@ claude-ping.json    # remote-box connection config
 - **vLLM baseline:** `int8_w4a8` via llm-compressor (compressed-tensors W4A8-INT8), served
   in stock vLLM, on Llama-3.1-8B-Instruct.
 
-## Status — COMPLETE (see bench/RESULTS.md for all numbers)
+## Status (see bench/RESULTS.md for all numbers; git log tells the story)
 
-The paper's kernel (RS-WGMMA, in-register IMAD+XOR dequant, fragment-order 4-bit pack,
-dequant/MMA overlap) is implemented, bit-exact, and serving in vLLM under CUDA graphs.
+The paper's kernel is implemented and optimized: RS-WGMMA with in-register IMAD+XOR
+dequant (mask-shift interleaved pack — true 2-instr/4-elem), **`wait<1>` + 3-buffer
+deep pipeline** (no per-tile WGMMA drain), **split-K** (env `LIQUIDGEMM_SPLITK` to tune),
+and a **fused reduce+scale+cast epilogue** (`w4a8_wgmma_rs_fused`). All bit-exact.
 
-**Production guidance (user decision, 2026-07-15): on Hopper prefer vLLM's native
-`quantization="fp8"` (dynamic) over our int8 mode for the 8-bit class.** Rationale:
-FP8 == INT8 tensor-core rate on Hopper; vLLM fp8 kernels are first-class; and fp8-W8
-encodes the *original* bf16 weights (~W8 fidelity) while our int8 mode stores
-W4-reconstructed weights — W4 error at W8 memory. int8 mode = fallback for non-FP8
-GPUs (A100) only. **LiquidGEMM's real value on Hopper = the 4-bit class** (w4/RS mode;
-in-tree competitor: vLLM's W4A8-FP8 `cutlass_w4a8`). Remaining w4 perf work on
-big-compute parts (H100/H800): TMA + multi-CTA warp specialization + split-K.
+- **Kernel beats cuBLAS bf16 at every shape/M on H20** (1.0–1.6×) and at decode tiles on
+  H100 (qkv 1.09×, gate_up 1.40×, down 1.34×) — at 4× less weight memory.
+- **Production guidance (user decision, 2026-07-15):** 8-bit class → vLLM native
+  `quantization="fp8"` (measured ≥ our int8 mode, better fidelity, zero custom code);
+  int8 mode = non-FP8-GPU (A100) fallback only. **LiquidGEMM's lane = the 4-bit class**
+  (`LIQUIDGEMM_W4=1`).
+- **Open problem — e2e vs kernel gap on big models at decode:** gemma-31B/H20 w4 serves
+  at 32.7 tok/s b1 vs bf16 52.3 despite every GEMM being faster; fused epilogue only
+  bought +6%, so the per-linear overhead hypothesis is largely disproven. A torch-profiler
+  trace of one decode step (bench/profile_w4.py → bench/profile_w4.out on the box) is the
+  active investigation. Suspects: eager-mode profiling parity, vision-tower/bf16-fallback
+  layers in gemma-4, pad-to-64 waste at M=1, attention kernels differing between modes.
+- Also open: prefill tiles (n128 / 2-warpgroup CTAs), TMA loads, calibrated checkpoints.
 
 Full plan: `/Users/husein.z/.claude/plans/functional-orbiting-kite.md`.
 
