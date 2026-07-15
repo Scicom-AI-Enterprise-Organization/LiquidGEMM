@@ -244,3 +244,17 @@ CUDA_VISIBLE_DEVICES=6 python bench/microbench.py
 CUDA_VISIBLE_DEVICES=6 python bench/accuracy.py --model Qwen/Qwen2.5-3B
 CUDA_VISIBLE_DEVICES=6 python bench/vllm_serving.py --model Qwen/Qwen2.5-3B --quant liquidgemm --batch 30
 ```
+
+## H20 re-bench with the deep-pipeline kernel (clean GPU 0)
+
+**Kernel-level: the paper's promise, delivered on production hardware.** RS-W4A8 beats
+cuBLAS bf16 at EVERY shape and every M on H20 (bit-exact): qkv 1.01–1.62×, o 1.06–1.46×,
+gate_up 1.27–1.57×, down 1.30–1.47×, at 4× less weight memory.
+
+**End-to-end, gemma-4-31B (b1/b30, graphs):** w4 30.7/790 @ 19.4 GiB · fp8 77.5/1056 @
+31.7 GiB · bf16 52.3/1170 @ 59.0 GiB. Despite winning every GEMM, w4 loses e2e: the
+per-linear pipeline (quant → RS op → split-K int32 partials → sum → scale epilogue, up to
+5 kernels + full int32 [S,Mp,N] GMEM round-trips) now costs more than the GEMM at decode.
+Next step (in progress): fused epilogue — S=1 writes scaled bf16 straight from the kernel;
+S>1 uses one fused reduce+scale kernel. (Qwen2.5-3B on H20 shows the same pattern
+amplified: w4 156/4327 vs bf16 319/8199 — tiny GEMMs, fixed overhead.)
