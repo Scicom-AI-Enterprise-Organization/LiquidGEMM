@@ -205,8 +205,18 @@ M≤128 & K≥4096). Kernel-level (M=64 decode tile, vs cuBLAS bf16):
 Also tried and **rejected**: fragment-order scale prepack (one coalesced 8B load replacing
 8 cached `__ldg` scale bytes/tile) — measured perf-neutral on H100 but +25% weight memory
 (6.65 vs 5.83 GiB). Not worth it in the memory lane; builder kept in `ops.py` for reference.
-Remaining dequant cost is ALU/pipeline-bound: next levers are PRMT-based nibble unpack,
-`wait<1>` deeper WGMMA pipelining (needs 3-4 B-buffers), and n128 tiles for prefill.
+**Mask-shift unpack landed** (the paper's weight-reorder trick: nibbles interleaved so
+unpack per register = AND / SHR+AND + IMAD + XOR — the true "2 arithmetic instructions
+per 4 elements"): gate_up M=64 121→103us; serving 96.6→**105.0** b1, 2669→**2861** b30.
+
+**Roofline honesty (the "shouldn't W4 be ~4× faster than bf16?" question — yes, it
+should):** at M=64 the W4 memory floor is ~¼ of bf16's (gate_up: ~18us vs ~71us), but the
+kernel sits at ~0.8–0.9× bf16, i.e. ~4–5× off its own ceiling. With dequant math now
+minimal, the measured gap is **pipeline depth**: one 128-thread warpgroup per CTA, a full
+WGMMA drain (`wait<0>` + `__syncthreads`) every K-tile, and single-batch WGMMA occupancy.
+Closing it = the deep restructure: 3-stage smem/fragment buffers + `wait<1>` (two WGMMA
+batches in flight, no per-tile drain), then 2-warpgroup CTAs — i.e. the full ImFP/ExCP
+engineering the paper spent its H800 effort on. That is the next focused session.
 
 In-tree W4A8 baseline: no official RedHatAI W4A8 Llama-3.1-8B checkpoint exists on HF
 (only third-party GPTQ variants); a rigorous llm-compressor W4A8 calibration run is the
