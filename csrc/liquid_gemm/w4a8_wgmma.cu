@@ -9,6 +9,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstdlib>
 
 #include <cute/tensor.hpp>
 
@@ -28,6 +31,28 @@ __device__ __forceinline__ T& wg_sel3(T& a, T& b, T& c) {
   if constexpr (I == 0) return a;
   else if constexpr (I == 1) return b;
   else return c;
+}
+
+// Fused split-K reduce + per-token/per-channel scale + bf16/fp16 cast in ONE pass —
+// replaces (partials.sum(0) -> narrow -> scale_epilogue), removing an int32 [Mp,N]
+// GMEM round-trip and two kernel launches per linear.
+template <typename T>
+__global__ void rs_finish_kernel(const int* __restrict__ acc,   // [S, Mp, N] int32
+                                 const float* __restrict__ ascale,  // [M]
+                                 const float* __restrict__ s1,      // [N]
+                                 T* __restrict__ y,                 // [M, N]
+                                 int S, int Mp, int M, int N) {
+  const long tot = (long)M * N;
+  const long plane = (long)Mp * N;
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < tot;
+       idx += (long)gridDim.x * blockDim.x) {
+    const int m = idx / N;
+    const int n = idx - (long)m * N;
+    const long o = (long)m * N + n;
+    int v = acc[o];
+    for (int s = 1; s < S; ++s) v += acc[(long)s * plane + o];
+    y[idx] = (T)((float)v * ascale[m] * s1[n]);
+  }
 }
 
 template <class ProblemShape, class CtaTiler,
@@ -410,13 +435,20 @@ w4a8_wgmma_rs_device(int M, int N, int K,
     }
   };
 
-  // Prologue: stage B tile kt0 and dequant A fragment kt0. (kt0 >= kt1 -> zero output,
-  // still written so the split-K reduction stays correct.)
+  // Prologue: stage B tiles kt0 and kt0+1 (prefetch depth 2 — the per-tile cp.async
+  // latency was measured to dominate at decode shapes) and dequant fragment kt0.
+  // (kt0 >= kt1 -> zero output, still written so the split-K reduction stays correct.)
   if (kt0 < kt1) {
     copy(copy_b, tBgB(_, _, _, kt0), tBsB(_, _, _, 0));
     cp_async_fence();
+    const bool pro_pf = (kt0 + 1 < kt1);
+    if (pro_pf) {
+      copy(copy_b, tBgB(_, _, _, kt0 + 1), tBsB(_, _, _, 1));
+      cp_async_fence();
+    }
     fill_frag(tCrA0, kt0);
-    cp_async_wait<0>();
+    if (pro_pf) cp_async_wait<1>();  // tile kt0 ready; kt0+1 may still be in flight
+    else cp_async_wait<0>();         // single tile: must be fully resident
   }
   __syncthreads();
   warpgroup_fence_operand(tCrC);
@@ -438,10 +470,17 @@ w4a8_wgmma_rs_device(int M, int N, int K,
     warpgroup_commit_batch();
     warpgroup_wait<1>();                              // kt-1 done; ktc stays in flight
     if (ktc + 1 < kt1) {
-      copy(copy_b, tBgB(_, _, _, ktc + 1), tBsB(_, _, _, in));
-      cp_async_fence();
+      const bool prefetched = (ktc + 2 < kt1);
+      if (prefetched) {                               // prefetch depth 2: issue X(ktc+2)
+        constexpr int i2 = (i + 2) % 3;               // last read by retired wgmma(ktc-1)
+        copy(copy_b, tBgB(_, _, _, ktc + 2), tBsB(_, _, _, i2));
+        cp_async_fence();
+      }
       fill_frag(fragN, ktc + 1);                      // overlaps in-flight WGMMA(ktc)
-      cp_async_wait<0>();
+      // X(ktc+1) must be resident before the next gemm; at the tail no new group was
+      // issued, so wait<1> would NOT cover it — drop to wait<0> there.
+      if (prefetched) cp_async_wait<1>();
+      else cp_async_wait<0>();
     }
     __syncthreads();                                   // warp-skew guard on buffer reuse
   };
@@ -480,10 +519,19 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
   const int G = K / group_size;
   // Split-K for the decode regime: small M leaves few CTAs while long K serializes the
   // mainloop (e.g. down-proj K=14336 = 112 K-tiles). Partial int32 sums are exact.
+  // LIQUIDGEMM_SPLITK overrides the small-M split factor for tuning.
   const int KT_total = K / RS_BK;
+  static const int kSplitEnv = []() {
+    const char* e = getenv("LIQUIDGEMM_SPLITK");
+    return e ? atoi(e) : 0;
+  }();
   int S = 1;
-  if (Mp <= 128 && KT_total >= 64) S = 4;
-  else if (Mp <= 128 && KT_total >= 32) S = 2;
+  if (Mp <= 128) {
+    if (kSplitEnv > 0) S = kSplitEnv;
+    else if (KT_total >= 64) S = 4;
+    else if (KT_total >= 32) S = 2;
+    if (S > KT_total) S = KT_total;
+  }
   auto c = torch::empty({(long)S * Mp, (long)N},
                         torch::dtype(torch::kInt32).device(x_i8.device()));
 
@@ -519,6 +567,81 @@ torch::Tensor w4a8_wgmma_rs(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s
       ? c
       : c.view({S, (long)Mp, (long)N}).sum(0, /*keepdim=*/false, torch::kInt32);
   return (Mp == M) ? acc : acc.narrow(0, 0, M);
+}
+
+// Fused end-to-end RS linear: RS-WGMMA grid -> ONE rs_finish kernel (split-K reduce +
+// ascale*s1 scale + bf16/fp16 cast). 2 kernel launches total; no int32 intermediates
+// beyond the unavoidable split-K partials.
+torch::Tensor w4a8_wgmma_rs_fused(torch::Tensor x_i8, torch::Tensor w, torch::Tensor s_u8,
+                                  torch::Tensor off_a, torch::Tensor ascale,
+                                  torch::Tensor s1, int64_t N, int64_t K,
+                                  int64_t group_size, int64_t out_dtype) {
+  TORCH_CHECK(x_i8.is_cuda() && x_i8.dtype() == torch::kInt8);
+  TORCH_CHECK(w.dtype() == torch::kUInt8 && group_size == 64);
+  TORCH_CHECK(N % RS_BM == 0 && K % RS_BK == 0, "N%64==0 and K%128==0 required");
+  TORCH_CHECK(ascale.dtype() == torch::kFloat32 && s1.dtype() == torch::kFloat32);
+  w = w.contiguous();
+  s_u8 = s_u8.contiguous();
+  off_a = off_a.contiguous();
+  ascale = ascale.contiguous();
+  s1 = s1.contiguous();
+  const int M = x_i8.size(0);
+  const int Mp = (M + RS_BN - 1) / RS_BN * RS_BN;
+  x_i8 = (Mp == M) ? x_i8.contiguous()
+                   : torch::constant_pad_nd(x_i8, {0, 0, 0, Mp - M}, 0).contiguous();
+  const int G = K / group_size;
+  const int KT_total = K / RS_BK;
+  static const int kSplitEnv = []() {
+    const char* e = getenv("LIQUIDGEMM_SPLITK");
+    return e ? atoi(e) : 0;
+  }();
+  int S = 1;
+  if (Mp <= 128) {
+    if (kSplitEnv > 0) S = kSplitEnv;
+    else if (KT_total >= 64) S = 4;
+    else if (KT_total >= 32) S = 2;
+    if (S > KT_total) S = KT_total;
+  }
+  auto c = torch::empty({(long)S * Mp, (long)N},
+                        torch::dtype(torch::kInt32).device(x_i8.device()));
+
+  auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<int8_t>{},
+                          make_shape(Int<RS_BN>{}, Int<RS_BK>{}, Int<3>{}));
+  TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>{},
+                                    Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+                                    Layout<Shape<_1, _16>>{});
+  TiledMMA mma = make_tiled_mma(RsMmaAtom{});
+  const int smem_bytes = cosize_v<decltype(sB)> * (int)sizeof(int8_t);
+  dim3 grid((int)N / RS_BM, Mp / RS_BN, S);
+  dim3 block(128);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto kernel = &w4a8_wgmma_rs_device<true, decltype(sB), decltype(copyB), decltype(mma)>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  kernel<<<grid, block, smem_bytes, stream>>>(
+      Mp, (int)N, (int)K, x_i8.data_ptr<int8_t>(), w.data_ptr<uint8_t>(),
+      s_u8.data_ptr<uint8_t>(), s_u8.data_ptr<uint8_t>(), off_a.data_ptr<uint8_t>(),
+      c.data_ptr<int32_t>(), G, sB, copyB, mma);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto dt = out_dtype == 1 ? torch::kFloat16
+                           : (out_dtype == 2 ? torch::kFloat32 : torch::kBFloat16);
+  auto y = torch::empty({M, (long)N}, torch::dtype(dt).device(x_i8.device()));
+  const int threads = 256;
+  const int blocks = (int)std::min<long>(65535, ((long)M * N + threads - 1) / threads);
+  if (dt == torch::kBFloat16)
+    rs_finish_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        c.data_ptr<int32_t>(), ascale.data_ptr<float>(), s1.data_ptr<float>(),
+        (__nv_bfloat16*)y.data_ptr(), S, Mp, M, (int)N);
+  else if (dt == torch::kFloat16)
+    rs_finish_kernel<__half><<<blocks, threads, 0, stream>>>(
+        c.data_ptr<int32_t>(), ascale.data_ptr<float>(), s1.data_ptr<float>(),
+        (__half*)y.data_ptr(), S, Mp, M, (int)N);
+  else
+    rs_finish_kernel<float><<<blocks, threads, 0, stream>>>(
+        c.data_ptr<int32_t>(), ascale.data_ptr<float>(), s1.data_ptr<float>(),
+        y.data_ptr<float>(), S, Mp, M, (int)N);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
 }
 
 // Stage 1: C[M,N] int32 = A[M,K] int8 @ B[N,K] int8^T  (TN, row-major inputs).

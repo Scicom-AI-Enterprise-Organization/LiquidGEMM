@@ -156,14 +156,14 @@ class LiquidGemmLinearMethod(LinearMethodBase):
         N = layer.lq_N
 
         if self.cfg.w4:
-            # True 4-bit weights via RS-WGMMA (in-register dequant -> INT8 tensor cores).
-            # The op pads tokens to its 64-token CTA tile internally (compile/graph-safe).
+            # True 4-bit weights via RS-WGMMA (in-register dequant -> INT8 tensor cores),
+            # fully fused: quant -> RS grid -> one reduce+scale+cast kernel. The op pads
+            # tokens to its 64-token CTA tile internally (compile/graph-safe).
             x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)
-            acc = torch.ops.liquidgemm.w4a8_wgmma_rs(
-                x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_s_u8, layer.lq_offset_a,
-                N, layer.lq_K, self.cfg.group_size, True)
             odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
-            y = torch.ops.liquidgemm.scale_epilogue(acc, ascale, layer.lq_s1, odt)
+            y = torch.ops.liquidgemm.w4a8_wgmma_rs_fused(
+                x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_offset_a, ascale, layer.lq_s1,
+                N, layer.lq_K, self.cfg.group_size, odt)
         else:
             # Production path: vLLM's fused per-token INT8 quant + CUTLASS INT8 GEMM
             # (cutlass_scaled_mm). Fast at all M, CUDA-graph-safe, fused scale+bias epilogue.

@@ -258,3 +258,15 @@ per-linear pipeline (quant → RS op → split-K int32 partials → sum → scal
 Next step (in progress): fused epilogue — S=1 writes scaled bf16 straight from the kernel;
 S>1 uses one fused reduce+scale kernel. (Qwen2.5-3B on H20 shows the same pattern
 amplified: w4 156/4327 vs bf16 319/8199 — tiny GEMMs, fixed overhead.)
+
+## Decode decomposition on real gemma-4-31B shapes (H20, M=1) — the honest picture
+
+`bench/decompose_w4.py` reconciles kernel vs e2e exactly (bf16: 15.45ms linears + 3.6ms
+rest = 19.1ms measured ✓). Finding: at M=1, cuBLAS switches to a ~95%-bandwidth GEMV
+(qkv: 176MB in 49.8us), while the RS tile kernel runs ~0.5TB/s effective — the earlier
+"beats bf16" result compared against cuBLAS's weak M=64 GEMM, not its strong M=1 GEMV.
+Split-K sweep (S=2..16): ±3%, not the answer. Prefetch-depth-2 for the activation
+pipeline: +7% (481→448us/layer), bit-exact. Remaining gap at M=1 is architectural:
+a dedicated W4 **GEMV** kernel for M≤16 (mask-shift dequant + full-bandwidth weight
+streaming; the old dp4a GEMV already reached ~900GB/s) is the identified next kernel.
+For batch~30-64 decode (production), the RS tile kernel remains the right engine.

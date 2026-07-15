@@ -81,3 +81,24 @@ def test_rs_w4a8_wgmma_pads_odd_M(M):
     xp = torch.cat([x_i8, x_i8.new_zeros(64 - M % 64 if M % 64 else 0, K)], 0)
     ref = torch._int_mm(xp, quant.dequantize_i8(qw).cuda().t().contiguous())[:M]
     assert torch.equal(got.contiguous(), ref)
+
+
+@pytest.mark.skipif(not _HAVE, reason="extension not built")
+@pytest.mark.parametrize("M", [1, 64, 100, 256])
+def test_rs_fused_matches_unfused_pipeline(M):
+    """Fused op (RS grid + one reduce/scale/cast kernel) == old 3-step pipeline, bitwise."""
+    from liquidgemm import quant, ops
+    torch.manual_seed(0)
+    N, K = 512, 14336  # long K -> exercises split-K inside the fused path
+    qw = quant.quantize_weight(torch.randn(N, K) * 0.05, 64)
+    w = ops.repack_rs_weight(qw).cuda()
+    s_u8, off_a, s1 = qw.s_u8.cuda(), qw.offset_a.cuda(), qw.s1.cuda()
+    x_i8 = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
+    ascale = (torch.rand(M, device="cuda") * 0.02 + 0.01).float()
+
+    acc = torch.ops.liquidgemm.w4a8_wgmma_rs(x_i8, w, s_u8, s_u8, off_a, N, K, 64, True)
+    ref = torch.ops.liquidgemm.scale_epilogue(acc.contiguous(), ascale, s1, 0)  # bf16
+    got = torch.ops.liquidgemm.w4a8_wgmma_rs_fused(
+        x_i8, w, s_u8, off_a, ascale, s1, N, K, 64, 0)
+    assert got.dtype == torch.bfloat16 and got.shape == (M, N)
+    assert torch.equal(got, ref), "fused path diverged from unfused pipeline"

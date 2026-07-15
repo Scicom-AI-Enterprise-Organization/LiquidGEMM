@@ -53,6 +53,12 @@ def _w4a8_wgmma_rs_fake(x_i8, w, spack, s_u8, off_a, N, K, group_size, packed):
     return x_i8.new_empty((x_i8.shape[0], N), dtype=torch.int32)
 
 
+@torch.library.register_fake("liquidgemm::w4a8_wgmma_rs_fused")
+def _w4a8_wgmma_rs_fused_fake(x_i8, w, s_u8, off_a, ascale, s1, N, K, group_size, out_dtype):
+    dt = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[int(out_dtype)]
+    return x_i8.new_empty((x_i8.shape[0], N), dtype=dt)
+
+
 def dequant_weight_i8(qw: LiquidQuantWeight) -> torch.Tensor:
     """Reconstruct INT8 weights [N, K] on-device via the CUDA IMAD+XOR kernel."""
     return torch.ops.liquidgemm.dequant_weight(

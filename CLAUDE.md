@@ -35,11 +35,12 @@ QServe/QoQ (`mit-han-lab/omniserve`), which we bootstrap the quantization algori
 - **Measured HBM bandwidth (idle GPU 6): ~3.9 TB/s copy/read, ~4.35 TB/s triad** — confirms
   the ~4 TB/s spec. 150.1 GB/GPU, 78 SMs, mem clock 3201 MHz, SM clock 1980 MHz, ECC on.
 
-### ⚠️ Shared box — use GPUs 6 and 7 only
-GPUs **0–5 are occupied by another tenant** (≈62 GB + 100% util each). **GPUs 6 and 7 are
-free.** Always `export CUDA_VISIBLE_DEVICES=6` (or 7) for builds/benchmarks, and **run
-`nvidia-smi` before any benchmark** — a contended GPU silently halves bandwidth (measured
-1.77 TB/s under contention vs 3.9 TB/s idle). Never benchmark on 0–5.
+### ⚠️ Shared box — check GPU occupancy before every run
+Another tenant runs jobs on this box and **which GPUs are free changes over time** (at
+different points: 0–5 busy, then all 8, then only 0–1 free). **Always run `nvidia-smi`
+first** and pin `CUDA_VISIBLE_DEVICES` to a fully idle GPU (0% util AND 0 MiB used) — a
+contended GPU silently halves bandwidth (measured 1.77 TB/s under contention vs 3.9 TB/s
+idle) and poisons every benchmark. If no GPU is free, use the RunPod H100 flow below.
 
 ## Remote workflow — use `claude-ping`, not raw ssh
 
