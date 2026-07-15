@@ -32,3 +32,4 @@ wandb/
 # Local env / secrets
 .env
 .DS_Store
+claude-ping.json
