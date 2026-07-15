@@ -270,3 +270,7 @@ pipeline: +7% (481→448us/layer), bit-exact. Remaining gap at M=1 is architectu
 a dedicated W4 **GEMV** kernel for M≤16 (mask-shift dequant + full-bandwidth weight
 streaming; the old dp4a GEMV already reached ~900GB/s) is the identified next kernel.
 For batch~30-64 decode (production), the RS tile kernel remains the right engine.
+
+**gemma-4-31B b30 serving arc (H20, CUDA graphs, 19.35 GiB true 4-bit):** 790 → 825
+(fused epilogue) → **876 tok/s** (prefetch-2) = 0.75× bf16 (1170) / 0.83× fp8 (1056) at
+3.0× / 1.6× less weight memory respectively.
