@@ -45,6 +45,21 @@ def register():
     return None
 
 
+def _salt_compile_cache(mode: str) -> None:
+    """Isolate vLLM's compile/AOT cache per LiquidGEMM mode.
+
+    LIQUIDGEMM_W4/GEMV change the captured graph (different layer buffers/branches)
+    but are invisible to ModelConfig.compute_hash, so a cached AOT graph from one mode
+    would be wrongly reused by another (manifests as KeyError: 'lq_rs' at engine
+    start). Called from LiquidGemmConfig.__init__, i.e. only for liquidgemm runs, in
+    the process that will compile; vllm.envs reads os.environ at access time.
+    """
+    import os
+    root = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+    if not root.rstrip("/").endswith("liquidgemm-" + mode):
+        os.environ["VLLM_CACHE_ROOT"] = os.path.join(root, "liquidgemm-" + mode)
+
+
 @register_quantization_config("liquidgemm")
 class LiquidGemmConfig(QuantizationConfig):
     def __init__(self, group_size: int = 64, w4: bool = False):
@@ -59,6 +74,8 @@ class LiquidGemmConfig(QuantizationConfig):
         #   pure decode / memory-constrained; dp4a is slow for M>16). Opt-in.
         env = os.environ.get("LIQUIDGEMM_W4")
         self.w4 = (env == "1") if env is not None else w4
+        _salt_compile_cache(("w4" if self.w4 else "int8") +
+                            ("-gemv" if os.environ.get("LIQUIDGEMM_GEMV") == "1" else ""))
 
     @classmethod
     def get_name(cls) -> str:

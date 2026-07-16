@@ -65,7 +65,7 @@ Throughput (tokens/s), CUDA graphs (vLLM default) unless noted:
 | config | throughput | weight mem |
 |---|---:|---:|
 | bf16 | 540 tok/s | 59.0 GiB |
-| **LiquidGEMM (INT8/CUTLASS)** | **938 tok/s (1.74×)** | **31.7 GiB (1.86× less)** |
+| **LiquidGEMM (INT8/CUTLASS)** | ~~938 tok/s (1.74×)~~ **RETRACTED — see Correction (2026-07-17)** | **31.7 GiB (1.86× less)** |
 
 On a 31B model the linear GEMMs dominate, so INT8's compute + halved weight bytes give a
 clear **1.74× throughput win** plus ~1.9× memory headroom (more KV / larger batch). NOTE:
@@ -309,3 +309,32 @@ dual-pack mode loaded at **33.67 GiB** vs 19.35 pure-w4 (heavier than the theore
 latency gain. Verdict: keep `LIQUIDGEMM_GEMV` opt-in for latency-sensitive single-stream
 only; **pure w4 stays the default recommendation**, and at production concurrency (b30)
 GEMV is irrelevant. The real b1 lever remains attention/framework, not the linears.
+
+## CORRECTION (2026-07-17) — the "int8 1.74× bf16 on gemma-31B" claim is retracted
+
+The user challenged the numbers ("fp16 still faster lol") and a clean same-GPU
+back-to-back re-measurement proved them right. The original bf16 baseline (540 tok/s)
+does not reproduce: it was measured in the pre-`--eager`-flag era (eager mode) while the
+other tenant loaded 6/8 GPUs (host CPU contention). Definitive numbers — gemma-4-31B,
+b30, out=128, CUDA graphs, same idle GPU, back to back:
+
+| mode | tok/s | vs bf16 | weights |
+|---|---:|---:|---:|
+| **bf16** | **1179** | 1.00× | 59.0 GiB |
+| fp8 dynamic | 1056 | 0.90× | 31.7 GiB |
+| LiquidGEMM int8 | 932 | 0.79× | 31.7 GiB |
+| LiquidGEMM w4 | 876 | 0.74× | 19.35 GiB |
+| (bf16 eager) | (947) | — | 59.0 GiB |
+
+**Honest bottom line for H20 + gemma-31B end-to-end: bf16 is the throughput king; every
+quantized mode trades throughput for memory.** fp8 gives 0.90× at half the memory; our w4
+gives 0.74× at one-third. int8 is strictly dominated by fp8 (same memory, slower, worse
+fidelity) — its prior "1.74×" win was an artifact of the depressed baseline, reinforcing
+the existing deprecation. LiquidGEMM's kernels do beat cuBLAS per-GEMM, but e2e the
+non-linear stack dominates on this model. The 4-bit mode's value proposition is memory
+(3× more KV/context/model headroom), full stop.
+
+**Bug found by this investigation:** vLLM's torch.compile/AOT cache key does not see the
+`LIQUIDGEMM_W4/GEMV` env switches, so a cached graph from one mode was reused by another
+(KeyError: 'lq_rs' at engine start). Fixed in the plugin by salting `VLLM_CACHE_ROOT`
+per mode in `LiquidGemmConfig.__init__` (`_salt_compile_cache`).
