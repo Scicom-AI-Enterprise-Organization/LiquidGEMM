@@ -87,8 +87,9 @@ torch runtime (e.g. nvcc 12.8 with torch+cu130) — sm_90a cubins are forward-co
 ## Status & roadmap
 
 Implemented: LiquidQuant · RS-WGMMA with in-register dequant · ImFP-style dequant/MMA
-overlap · split-K · fused epilogue · vLLM plugin (CUDA-graph-safe) · full benchmark suite.
-Open: per-linear framework overhead at small batch (profiling), prefill tiles (n128 /
-2-warpgroup CTAs), TMA loads, llm-compressor-calibrated checkpoints.
+overlap · split-K · fused epilogue · decode GEMV (`LIQUIDGEMM_GEMV=1`, M≤16, 571–939 GB/s,
+−29% decode linear time) · vLLM plugin (CUDA-graph-safe) · full benchmark suite.
+Open: prefill tiles (n128 / 2-warpgroup CTAs), TMA loads, llm-compressor-calibrated
+checkpoints, GEMV serving re-measure (box was occupied).
 
 MIT-style; see the paper for the original algorithm design.

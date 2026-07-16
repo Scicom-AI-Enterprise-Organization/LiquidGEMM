@@ -137,6 +137,14 @@ class LiquidGemmLinearMethod(LinearMethodBase):
             layer.register_buffer("lq_rs", ops.repack_rs_weight(qw).to(dev))
             layer.register_buffer("lq_s_u8", qw.s_u8.to(dev))
             layer.register_buffer("lq_offset_a", qw.offset_a.to(dev))
+            # Opt-in decode GEMV (LIQUIDGEMM_GEMV=1): also store the row-major interleaved
+            # pack (total 1 byte/weight) and dispatch the M<=16 GEMV — ~2x faster decode
+            # at low concurrency, at the cost of the pure-4-bit memory story.
+            import os
+            layer.lq_gemv = (os.environ.get("LIQUIDGEMM_GEMV") == "1"
+                             and qw.K % 128 == 0)
+            if layer.lq_gemv:
+                layer.register_buffer("lq_gp", ops.pack_gemv_interleaved(qw).to(dev))
         else:
             # INT8 storage (== W4 values, ~2x memory) for vLLM's CUTLASS INT8 GEMM. cutlass
             # wants the B operand column-major [K,N] == a contiguous [N,K] viewed with .t().
@@ -161,9 +169,14 @@ class LiquidGemmLinearMethod(LinearMethodBase):
             # tokens to its 64-token CTA tile internally (compile/graph-safe).
             x_i8, ascale = torch.ops.liquidgemm.quant_per_token(x2)
             odt = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}.get(x.dtype, 0)
-            y = torch.ops.liquidgemm.w4a8_wgmma_rs_fused(
-                x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_offset_a, ascale, layer.lq_s1,
-                N, layer.lq_K, self.cfg.group_size, odt)
+            if getattr(layer, "lq_gemv", False) and x_i8.shape[0] <= 16:
+                y = torch.ops.liquidgemm.w4a8_gemv2(
+                    x_i8, layer.lq_gp, layer.lq_s_u8, layer.lq_offset_a, ascale,
+                    layer.lq_s1, N, layer.lq_K, self.cfg.group_size, odt)
+            else:
+                y = torch.ops.liquidgemm.w4a8_wgmma_rs_fused(
+                    x_i8, layer.lq_rs, layer.lq_s_u8, layer.lq_offset_a, ascale,
+                    layer.lq_s1, N, layer.lq_K, self.cfg.group_size, odt)
         else:
             # Production path: vLLM's fused per-token INT8 quant + CUTLASS INT8 GEMM
             # (cutlass_scaled_mm). Fast at all M, CUDA-graph-safe, fused scale+bias epilogue.

@@ -57,12 +57,23 @@ for name, N, K in shapes:
             return torch.ops.liquidgemm.w4a8_wgmma_rs_fused(
                 xi, rs, su8, off, asc, s1, N, K, 64, 0)
         tw = t(w4)
+        tg = tb
+        if K % 128 == 0:
+            gp = ops.pack_gemv_interleaved(qw).cuda()
+
+            def gv():
+                xi, asc = torch.ops.liquidgemm.quant_per_token(x)
+                return torch.ops.liquidgemm.w4a8_gemv2(
+                    xi, gp, su8, off, asc, s1, N, K, 64, 0)
+            tg = t(gv)
     else:
-        tw = tb  # plugin falls back to bf16 for unaligned layers
+        tw = tg = tb  # plugin falls back to bf16 for unaligned layers
+    gbps = (N * K / 2) / (tg * 1e-3) / 1e9 if aligned else 0
     print(f"{name:8s} N={N:6d} K={K:6d} aligned={aligned} "
-          f"bf16 {tb*1e3:7.1f}us  w4 {tw*1e3:7.1f}us  ({tb/tw:.2f}x)", flush=True)
+          f"bf16 {tb*1e3:7.1f}us  w4-rs {tw*1e3:7.1f}us ({tb/tw:.2f}x)  "
+          f"w4-gemv {tg*1e3:7.1f}us ({tb/tg:.2f}x, {gbps:.0f} GB/s)", flush=True)
     tot_bf += tb
-    tot_w4 += tw
+    tot_w4 += min(tw, tg)
 
 print(f"\nper-layer linears: bf16 {tot_bf*1e3:.0f}us  w4 {tot_w4*1e3:.0f}us", flush=True)
 print(f"x {L} layers: bf16 {tot_bf*L:.2f}ms  w4 {tot_w4*L:.2f}ms", flush=True)

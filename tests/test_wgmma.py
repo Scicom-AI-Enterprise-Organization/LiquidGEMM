@@ -102,3 +102,23 @@ def test_rs_fused_matches_unfused_pipeline(M):
         x_i8, w, s_u8, off_a, ascale, s1, N, K, 64, 0)
     assert got.dtype == torch.bfloat16 and got.shape == (M, N)
     assert torch.equal(got, ref), "fused path diverged from unfused pipeline"
+
+
+@pytest.mark.skipif(not _HAVE, reason="extension not built")
+@pytest.mark.parametrize("M", [1, 3, 8, 16])
+def test_gemv2_matches_reference(M):
+    """Decode GEMV (mask-shift interleaved pack, fused epilogue) == exact reference."""
+    from liquidgemm import quant, ops
+    torch.manual_seed(0)
+    N, K = 512, 4096
+    qw = quant.quantize_weight(torch.randn(N, K) * 0.05, 64)
+    gp = ops.pack_gemv_interleaved(qw).cuda()
+    s_u8, off_a, s1 = qw.s_u8.cuda(), qw.offset_a.cuda(), qw.s1.cuda()
+    x_i8 = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
+    ascale = (torch.rand(M, device="cuda") * 0.02 + 0.01).float()
+    got = torch.ops.liquidgemm.w4a8_gemv2(x_i8, gp, s_u8, off_a, ascale, s1, N, K, 64, 0)
+    xp = torch.cat([x_i8, x_i8.new_zeros(32 - M, K)], 0)
+    acc = torch._int_mm(xp, quant.dequantize_i8(qw).cuda().t().contiguous())[:M]
+    ref = torch.ops.liquidgemm.scale_epilogue(acc.contiguous(), ascale, s1, 0)
+    assert got.dtype == torch.bfloat16 and got.shape == (M, N)
+    assert torch.equal(got, ref), f"gemv2 mismatch at M={M}"

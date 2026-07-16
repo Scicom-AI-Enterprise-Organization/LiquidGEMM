@@ -59,6 +59,22 @@ def _w4a8_wgmma_rs_fused_fake(x_i8, w, s_u8, off_a, ascale, s1, N, K, group_size
     return x_i8.new_empty((x_i8.shape[0], N), dtype=dt)
 
 
+@torch.library.register_fake("liquidgemm::w4a8_gemv2")
+def _w4a8_gemv2_fake(x_i8, gpack, s_u8, off_a, ascale, s1, N, K, group_size, out_dtype):
+    dt = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[int(out_dtype)]
+    return x_i8.new_empty((x_i8.shape[0], N), dtype=dt)
+
+
+def pack_gemv_interleaved(qw: LiquidQuantWeight) -> torch.Tensor:
+    """Row-major nibble pack for the GEMV, interleaved per 8-nibble octet along K so the
+    kernel unpacks with mask/shift only: byte b of octet h = w[8h+b] | w[8h+4+b] << 4."""
+    q = qw.qweight_u4  # [N, K] uint8 in 0..15
+    N, K = q.shape
+    o = q.view(N, K // 8, 2, 4)              # [N, octet, half, lane]
+    packed = (o[:, :, 0, :] | (o[:, :, 1, :] << 4)).to(torch.uint8)
+    return packed.reshape(N, K // 2).contiguous()
+
+
 def dequant_weight_i8(qw: LiquidQuantWeight) -> torch.Tensor:
     """Reconstruct INT8 weights [N, K] on-device via the CUDA IMAD+XOR kernel."""
     return torch.ops.liquidgemm.dequant_weight(

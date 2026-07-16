@@ -31,6 +31,10 @@ torch::Tensor w4a8_wgmma_rs_fused(torch::Tensor x_i8, torch::Tensor w, torch::Te
                                   torch::Tensor s1, int64_t N, int64_t K,
                                   int64_t group_size, int64_t out_dtype);
 
+torch::Tensor w4a8_gemv2(torch::Tensor x_i8, torch::Tensor gpack, torch::Tensor s_u8,
+                         torch::Tensor off_a, torch::Tensor ascale, torch::Tensor s1,
+                         int64_t N, int64_t K, int64_t group_size, int64_t out_dtype);
+
 torch::Tensor scale_epilogue(torch::Tensor acc, torch::Tensor ascale, torch::Tensor s1,
                              int64_t out_dtype);
 
@@ -51,6 +55,7 @@ TORCH_LIBRARY(liquidgemm, m) {
   m.def("wgmma_rs_a_coords", &liquidgemm::wgmma_rs_a_coords);
   m.def("w4a8_wgmma_rs(Tensor x_i8, Tensor w, Tensor spack, Tensor s_u8, Tensor off_a, int N, int K, int group_size, bool packed) -> Tensor");
   m.def("w4a8_wgmma_rs_fused(Tensor x_i8, Tensor w, Tensor s_u8, Tensor off_a, Tensor ascale, Tensor s1, int N, int K, int group_size, int out_dtype) -> Tensor");
+  m.def("w4a8_gemv2(Tensor x_i8, Tensor gpack, Tensor s_u8, Tensor off_a, Tensor ascale, Tensor s1, int N, int K, int group_size, int out_dtype) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(liquidgemm, CUDA, m) {
@@ -62,6 +67,7 @@ TORCH_LIBRARY_IMPL(liquidgemm, CUDA, m) {
   m.impl("w4a8_wgmma", &liquidgemm::w4a8_wgmma);
   m.impl("w4a8_wgmma_rs", &liquidgemm::w4a8_wgmma_rs);
   m.impl("w4a8_wgmma_rs_fused", &liquidgemm::w4a8_wgmma_rs_fused);
+  m.impl("w4a8_gemv2", &liquidgemm::w4a8_gemv2);
 }
 
 // Empty module so `import liquidgemm._C` succeeds; the TORCH_LIBRARY static initializers

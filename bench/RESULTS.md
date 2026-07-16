@@ -274,3 +274,27 @@ For batch~30-64 decode (production), the RS tile kernel remains the right engine
 **gemma-4-31B b30 serving arc (H20, CUDA graphs, 19.35 GiB true 4-bit):** 790 → 825
 (fused epilogue) → **876 tok/s** (prefetch-2) = 0.75× bf16 (1170) / 0.83× fp8 (1056) at
 3.0× / 1.6× less weight memory respectively.
+
+## Decode GEMV2 (M≤16) — closing the M=1 gap
+
+`csrc/liquid_gemm/gemv2.cu`: warp-per-output-row weight streaming with the mask-shift
+interleaved pack (`pack_gemv_interleaved`, AND/SHR+AND + IMAD + XOR per 4 elems), dp4a
+accumulate, fully fused warp-reduce + scale + cast epilogue (single kernel, no int32
+intermediate). Bit-exact (27/27 tests). Real gemma-4-31B shapes at M=1 on idle H20:
+
+| shape | bf16 GEMV | w4-RS tile | **w4-GEMV2** | eff. BW |
+|---|---:|---:|---:|---:|
+| qkv 16384←5376 | 49.9us | 82.8us | **57.9us (0.86×)** | 761 GB/s |
+| o 5376←8192 | 27.3us | 54.9us | **35.4us (0.77×)** | 622 GB/s |
+| gate_up 43008←5376 | 115.1us | 165.6us | **123.2us (0.93×)** | 939 GB/s |
+| down 5376←21504 | 63.8us | 145.8us | **101.2us (0.63×)** | 571 GB/s |
+| per-layer | 256us | 448us | **318us** | |
+
+Decode linears 448→318us/layer (−29%); projected gemma b1: ~30.6→~22.8ms/token
+(~44 tok/s vs bf16 52). An ILP-2 variant (64 weights/lane/step) was tried and measured
+30–40% *slower* (register pressure > load ILP on H20) — reverted, documented in-kernel.
+
+Deployment: `LIQUIDGEMM_GEMV=1` opt-in on top of `LIQUIDGEMM_W4=1` — stores both packs
+(≈1 byte/weight total, still 2× less than int8/fp8) and dispatches GEMV2 at M≤16, RS
+tiles above. Default w4 mode stays pure 4-bit. Serving re-measure pending a free GPU
+(box fully occupied by the other tenant at time of writing).
