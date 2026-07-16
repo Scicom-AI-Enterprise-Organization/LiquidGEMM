@@ -298,3 +298,14 @@ Deployment: `LIQUIDGEMM_GEMV=1` opt-in on top of `LIQUIDGEMM_W4=1` — stores bo
 (≈1 byte/weight total, still 2× less than int8/fp8) and dispatches GEMV2 at M≤16, RS
 tiles above. Default w4 mode stays pure 4-bit. Serving re-measure pending a free GPU
 (box fully occupied by the other tenant at time of writing).
+
+**GEMV2 end-to-end (gemma-4-31B, H20, clean idle GPU, CUDA graphs):** `LIQUIDGEMM_W4=1
+LIQUIDGEMM_GEMV=1` → b1 **35.2 tok/s** (vs 32.7 pure-w4, +8%; bf16 52.3, fp8 77.5);
+b30 881 (== 876 pure-w4, GEMV only fires at M≤16). Honest read: the kernel-level −29%
+on decode linears translated to only +8% e2e — at M=1 on this model, non-linear time
+(attention, quant, framework) dominates more than the decomposition assumed. Memory:
+dual-pack mode loaded at **33.67 GiB** vs 19.35 pure-w4 (heavier than the theoretical
+~27; load-peak included) — so GEMV mode trades most of the 4-bit memory win for a small
+latency gain. Verdict: keep `LIQUIDGEMM_GEMV` opt-in for latency-sensitive single-stream
+only; **pure w4 stays the default recommendation**, and at production concurrency (b30)
+GEMV is irrelevant. The real b1 lever remains attention/framework, not the linears.
