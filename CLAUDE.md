@@ -121,7 +121,13 @@ and a **fused reduce+scale+cast epilogue** (`w4a8_wgmma_rs_fused`). All bit-exac
   `quantization="fp8"` (measured ≥ our int8 mode, better fidelity, zero custom code);
   int8 mode = non-FP8-GPU (A100) fallback only. **LiquidGEMM's lane = the 4-bit class**
   (`LIQUIDGEMM_W4=1`).
-- **Open problem — e2e vs kernel gap on big models at decode:** gemma-31B/H20 w4 serves
+- **e2e truth (clean same-GPU, gemma-31B b30): bf16 1179 > fp8 1056 > int8 932 > w4 876
+  tok/s** — quant modes trade throughput for memory on H20 (w4: 0.74× at 3× less mem).
+  Kernels beat cuBLAS per-GEMM; the non-linear stack dominates e2e on this model.
+- **AOT-cache rule:** vLLM's compile cache can't see env-var mode switches — the plugin
+  salts VLLM_CACHE_ROOT per mode (`_salt_compile_cache`); never share a cache dir across
+  LIQUIDGEMM_W4/GEMV modes.
+- **Explained (was open) — e2e vs kernel gap on big models at decode:** gemma-31B/H20 w4 serves
   at 32.7 tok/s b1 vs bf16 52.3 despite every GEMM being faster; fused epilogue only
   bought +6%, so the per-linear overhead hypothesis is largely disproven. A torch-profiler
   trace of one decode step (bench/profile_w4.py → bench/profile_w4.out on the box) is the
@@ -147,8 +153,10 @@ Full plan: `/Users/husein.z/.claude/plans/functional-orbiting-kite.md`.
   registers `quantization="liquidgemm"` (+ `vllm.general_plugins` entry point). Dedicated
   venv `/share/venvs/vllm` (vLLM 0.25.1, torch 2.11+cu130). Two modes:
   - **default (INT8/CUTLASS):** LiquidQuant weights as int8 through vLLM's
-    `cutlass_scaled_mm` — fast at all M, ~2× memory, CUDA-graph-safe. gemma-4-31B @ b30:
-    **1.74× bf16**, 31.7 vs 59 GiB.
+    `cutlass_scaled_mm` — CUDA-graph-safe, ~2× memory. gemma-4-31B @ b30 (clean,
+    2026-07-17): 932 tok/s = **0.79× bf16** (the earlier "1.74×" used a depressed
+    eager+contention bf16 baseline and is retracted — see bench/RESULTS.md Correction).
+    Strictly dominated by fp8 on Hopper; A100 fallback only.
   - **`LIQUIDGEMM_W4=1` (RS-WGMMA, the paper's kernel):** true 4-bit in VRAM; in-register
     dequant → INT8 WGMMA (`csrc/liquid_gemm/w4a8_wgmma.cu`, `w4a8_wgmma_rs`). Kernel
     ~1.0–1.1× bf16 at M≥128 on H20 (qkv/gate_up), 4× less weight memory. Needs K%128, N%64.
